@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check release-note layout
+        shell: pwsh
+        run: .\scripts\release-notes.ps1 -Check
+
+      - name: Run unittest suite
+        shell: pwsh
+        run: python tests\test_ddns_go_ctl.py

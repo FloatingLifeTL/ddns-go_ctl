@@ -1,0 +1,19 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# 构建与打包产物
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# 运行时数据
+ctl-data/
+*.log
+
+# 私有目录
+_Private/
