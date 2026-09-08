@@ -68,7 +68,17 @@ import subprocess
 import sys
 import threading
 import time
-from typing import BinaryIO, Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    BinaryIO,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    runtime_checkable,
+)
 import unicodedata
 import uuid
 import webbrowser
@@ -317,6 +327,145 @@ LOG_FILE_PATTERN = re.compile(
 )
 
 
+# ===== 接口定义（typing.Protocol + Settings）=====
+# 组件边界用 Protocol 声明，具体实现只需结构匹配（鸭子类型）。
+# 实现类一律继续调用本模块的模块级函数/全局，使测试的 mock.patch 拦截路径不变。
+
+@dataclass(frozen=True)
+class Settings:
+    """控制器配置聚合：DDNS-GO 启动参数组装与可调参数的唯一来源。
+
+    字段默认来自模块顶部的 DDNS_GO_PARAMS 派生常量与脚本配置常量；
+    手动改配置请改 DDNS_GO_PARAMS / 对应常量，不要在调用处硬编码。
+    """
+
+    port: int = PORT
+    start_timeout_seconds: int = START_TIMEOUT_SECONDS
+    stop_timeout_seconds: int = STOP_TIMEOUT_SECONDS
+    sync_interval_seconds: Optional[int] = SYNC_INTERVAL_SECONDS
+    cache_times: Optional[int] = CACHE_TIMES
+    dns_servers: Optional[str] = DNS_SERVERS
+    config_path_override: Optional[str] = CONFIG_PATH_OVERRIDE
+
+    def build_start_arguments(
+        self, executable_path: Path, config_path: Path
+    ) -> List[str]:
+        """组装 DDNS-GO 启动参数；配置为 None 的项一律不传，沿用其自身默认值。"""
+
+        arguments = [
+            str(executable_path),
+            "-l",
+            f":{self.port}",
+            "-c",
+            str(config_path),
+        ]
+        if self.sync_interval_seconds is not None:
+            arguments += ["-f", str(self.sync_interval_seconds)]
+        if self.cache_times is not None:
+            arguments += ["-cacheTimes", str(self.cache_times)]
+        if self.dns_servers is not None:
+            arguments += ["-dns", self.dns_servers]
+        for extra in DDNS_GO_EXTRA_ARGS:
+            if isinstance(extra, str):
+                arguments.append(extra)
+            else:
+                flag, *values = extra
+                arguments.append(flag)
+                arguments.extend(str(value) for value in values)
+        return arguments
+
+
+@runtime_checkable
+class IProcessOperations(Protocol):
+    """Win32 原始进程操作；句柄由调用方负责关闭。"""
+
+    def open_process(self, access: int, process_id: int): ...
+    def query_process_path(self, handle) -> Path: ...
+    def terminate_process(self, handle, exit_code: int = 1) -> bool: ...
+    def wait_for_single_object(self, handle, timeout_ms: int) -> int: ...
+    def close_handle(self, handle) -> None: ...
+
+
+@runtime_checkable
+class IPortQuery(Protocol):
+    """端口监听查询；返回监听指定端口的 PID 列表。"""
+
+    def query(self, port: int) -> List[int]: ...
+
+
+@runtime_checkable
+class IRuntimeStateStore(Protocol):
+    """运行状态文件的读写。"""
+
+    def read(self) -> Tuple[bool, Optional[RuntimeState]]: ...
+    def write(self, state: RuntimeState) -> None: ...
+
+
+@runtime_checkable
+class ILogManager(Protocol):
+    """日志文件预留、清理、列出与最新定位。"""
+
+    def reserve(self, started_at: Optional[datetime] = None) -> Path: ...
+    def prune(
+        self,
+        keep_count: int,
+        current_path: Optional[Path] = None,
+        protected_paths: Iterable[Path] = (),
+    ) -> List[Path]: ...
+    def list_log_files(self) -> List[Path]: ...
+    def latest(self) -> Optional[Path]: ...
+
+
+@runtime_checkable
+class IProcessSpawner(Protocol):
+    """创建子进程（日志转发器）；返回 Popen 句柄。"""
+
+    def spawn(self, command: Sequence[str], **options) -> subprocess.Popen: ...
+
+
+@runtime_checkable
+class IRenderContext(Protocol):
+    """主菜单整帧渲染所需的最小控制器视图；实现只需结构满足。
+
+    仅声明 render 实际用到的字段与格式化方法，避免 UI 接口反向依赖
+    具体 DdnsController，渲染层与业务实现解耦。
+    """
+
+    port: int
+    script_directory: Path
+    log_directory: Path
+    config_path: Path
+
+    def display_path(self, path: Path) -> str: ...
+
+
+@runtime_checkable
+class IConsoleOutput(Protocol):
+    """控制台输出能力（着色、整帧渲染、提示、回显）。"""
+
+    def colorize(self, text: str, color: str) -> str: ...
+    def render(
+        self,
+        state: DdnsState,
+        controller: IRenderContext,
+        last_result: Optional[ActionResult],
+    ) -> None: ...
+    def prompt(self, text: str) -> None: ...
+    def echo(self, text: str) -> None: ...
+
+
+@runtime_checkable
+class IKeyReader(Protocol):
+    """单键与数字输入能力。"""
+
+    def read_key(self, prompt_text: str = "请选择：") -> str: ...
+    def read_line_number(
+        self,
+        prompt_text: str = "跳转到行号: ",
+        on_invalid: Optional[Callable[[], None]] = None,
+    ) -> Optional[int]: ...
+
+
 class IoCounters(ctypes.Structure):
     """JOB_OBJECT_EXTENDED_LIMIT_INFORMATION 所需的 Win32 I/O 计数结构。"""
 
@@ -453,6 +602,159 @@ def _win32_os_error() -> OSError:
 
     error_code = ctypes.get_last_error()
     return OSError(error_code, ctypes.FormatError(error_code))
+
+
+# ===== 基础设施实现（结构满足上方 Protocol，mock 仍可拦截模块级函数）=====
+
+class Win32ProcessOperations:
+    """kernel32 原始进程操作的直接封装。
+
+    行为与原 DdnsController 内联实现一致；open_process 对已退出 PID 返回 None，
+    terminate_process 失败返回 False（由调用方按 PID 构造错误文案）。
+    """
+
+    def open_process(self, access: int, process_id: int):
+        """按权限打开进程句柄；进程不存在时返回 None。"""
+
+        _require_kernel32()
+
+        handle = KERNEL32.OpenProcess(access, False, process_id)
+        if handle:
+            return handle
+
+        # OpenProcess 对已经退出或不存在的 PID 返回 ERROR_INVALID_PARAMETER；
+        # 这是正常竞态，不应当显示成查询错误。
+        if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
+            return None
+        raise _win32_os_error()
+
+    def query_process_path(self, handle) -> Path:
+        """通过进程句柄查询完整映像路径。"""
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if not KERNEL32.QueryFullProcessImageNameW(
+            handle, 0, buffer, ctypes.byref(size)
+        ):
+            raise _win32_os_error()
+        return Path(buffer.value)
+
+    def terminate_process(self, handle, exit_code: int = 1) -> bool:
+        """终止进程；返回 Win32 调用结果，失败文案由调用方按 PID 构造。"""
+
+        return bool(KERNEL32.TerminateProcess(handle, exit_code))
+
+    def wait_for_single_object(self, handle, timeout_ms: int) -> int:
+        """等待句柄信号或超时，返回 Win32 等待结果。"""
+
+        return int(KERNEL32.WaitForSingleObject(handle, timeout_ms))
+
+    def close_handle(self, handle) -> None:
+        """关闭句柄。"""
+
+        KERNEL32.CloseHandle(handle)
+
+
+class NetstatPortQuery:
+    """netstat.exe TCP 监听查询；查询失败与无监听严格区分。"""
+
+    def query(self, port: int) -> List[int]:
+        """查询监听 PID；命令失败时抛错，绝不伪造为空监听结果。"""
+
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        netstat_path = system_root / "System32" / "netstat.exe"
+        if not netstat_path.is_file():
+            raise DdnsError("系统组件 netstat.exe 不可用。")
+
+        # 不加 -p tcp：该过滤器只返回 IPv4 表，纯 IPv6 的监听者会整个消失，
+        # 使端口占用检查失真。全表中的 UDP 与非监听行由 LISTENER_PATTERN 排除，
+        # 同一进程的双栈两行由下方的集合去重。
+        try:
+            completed = subprocess.run(
+                [str(netstat_path), "-ano"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding=locale.getpreferredencoding(False),
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+                timeout=LISTENER_QUERY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DdnsError(
+                f"netstat.exe 查询超过 {LISTENER_QUERY_TIMEOUT_SECONDS} 秒。"
+            ) from exc
+        except OSError as exc:
+            raise DdnsError(f"netstat.exe 查询失败：{exc}") from exc
+
+        if completed.returncode != 0:
+            raise DdnsError(f"netstat.exe 查询失败，退出码：{completed.returncode}。")
+
+        return parse_listener_process_ids(completed.stdout.splitlines(), port)
+
+
+class FileRuntimeStateStore:
+    """绑定路径的运行状态文件读写；委托模块级原子写函数。"""
+
+    def __init__(self, runtime_state_path: Path) -> None:
+        """绑定运行状态文件路径。"""
+
+        self.runtime_state_path = runtime_state_path
+
+    def read(self) -> Tuple[bool, Optional[RuntimeState]]:
+        """读取并校验运行状态；不存在返回 (False, None)，损坏则明确报错。"""
+
+        return read_runtime_state(self.runtime_state_path)
+
+    def write(self, state: RuntimeState) -> None:
+        """原子替换写入运行状态。"""
+
+        write_runtime_state(self.runtime_state_path, state)
+
+
+class FileLogManager:
+    """绑定日志目录的日志管理；委托模块级日志函数。"""
+
+    def __init__(self, log_directory: Path) -> None:
+        """绑定日志目录。"""
+
+        self.log_directory = log_directory
+
+    def reserve(self, started_at: Optional[datetime] = None) -> Path:
+        """独占预留本次日志名。"""
+
+        return reserve_log_file(self.log_directory, started_at)
+
+    def prune(
+        self,
+        keep_count: int,
+        current_path: Optional[Path] = None,
+        protected_paths: Iterable[Path] = (),
+    ) -> List[Path]:
+        """按时间顺序清理旧日志，返回清理失败路径。"""
+
+        return prune_log_files(
+            self.log_directory, keep_count, current_path, protected_paths
+        )
+
+    def list_log_files(self) -> List[Path]:
+        """列出规范命名的日志文件。"""
+
+        return _list_log_files(self.log_directory)
+
+    def latest(self) -> Optional[Path]:
+        """返回命名最新的一份日志。"""
+
+        return latest_log_file(self.log_directory)
+
+
+class SubprocessSpawner:
+    """subprocess.Popen 封装；透传调用方全部关键字参数。"""
+
+    def spawn(self, command: Sequence[str], **options) -> subprocess.Popen:
+        """按给定命令与选项创建子进程。"""
+
+        return subprocess.Popen(command, **options)
 
 
 class SingleInstanceMutex:
@@ -1234,8 +1536,19 @@ class DdnsController:
         cache_times: Optional[int] = CACHE_TIMES,
         dns_servers: Optional[str] = DNS_SERVERS,
         config_path_override: Optional[str] = CONFIG_PATH_OVERRIDE,
+        *,
+        process_ops: Optional[IProcessOperations] = None,
+        port_query: Optional[IPortQuery] = None,
+        state_store: Optional[IRuntimeStateStore] = None,
+        log_manager: Optional[ILogManager] = None,
+        spawner: Optional[IProcessSpawner] = None,
     ) -> None:
-        """校验可调参数并预解析脚本目录下的固定路径。"""
+        """校验可调参数并预解析脚本目录下的固定路径。
+
+        末尾的 keyword-only 参数是接口隔离的注入点：默认为真实实现，调用方可
+        传入替代实现（mock 或换源）；注入的实现类仍委托模块级函数，保持原测试
+        的 mock.patch 拦截路径不变。
+        """
 
         if not 1 <= port <= 65535:
             raise ValueError("Port 必须是 1 到 65535 之间的整数。")
@@ -1253,14 +1566,6 @@ class DdnsController:
             raise ValueError("CONFIG_PATH_OVERRIDE 必须是非空路径或 None。")
 
         self.script_directory = script_directory.resolve()
-        self.port = port
-        self.start_timeout_seconds = start_timeout_seconds
-        self.stop_timeout_seconds = stop_timeout_seconds
-        self.sync_interval_seconds = sync_interval_seconds
-        self.cache_times = cache_times
-        self.dns_servers = (
-            dns_servers.strip() if dns_servers is not None else None
-        )
         self.executable_path = (self.script_directory / EXECUTABLE_NAME).resolve()
         # 目标路径在控制器生命周期内不变，预先规范化可避免每次核验重复处理。
         self._normalized_executable_path = normalized_path(self.executable_path)
@@ -1282,30 +1587,79 @@ class DdnsController:
             self.data_directory / RUNTIME_STATE_DIRECTORY_NAME / RUNTIME_STATE_NAME
         )
 
+        # 接口隔离装配：未注入时使用真实实现；注入项由调用方保证满足协议。
+        self.process_ops = (
+            process_ops if process_ops is not None else Win32ProcessOperations()
+        )
+        self.port_query = (
+            port_query if port_query is not None else NetstatPortQuery()
+        )
+        self.state_store = (
+            state_store
+            if state_store is not None
+            else FileRuntimeStateStore(self.runtime_state_path)
+        )
+        self.log_manager = (
+            log_manager if log_manager is not None else FileLogManager(self.log_directory)
+        )
+        self.spawner = spawner if spawner is not None else SubprocessSpawner()
+        # Settings 是可调参数的唯一来源；dns_servers 在此统一规范化一次，
+        # 实例的 port / 超时等只读属性均委托给 settings，避免两套状态漂移。
+        self.settings = Settings(
+            port=port,
+            start_timeout_seconds=start_timeout_seconds,
+            stop_timeout_seconds=stop_timeout_seconds,
+            sync_interval_seconds=sync_interval_seconds,
+            cache_times=cache_times,
+            dns_servers=dns_servers.strip() if dns_servers is not None else None,
+            config_path_override=config_path_override,
+        )
+
+    @property
+    def port(self) -> int:
+        """监听端口（只读，委托 Settings）。"""
+
+        return self.settings.port
+
+    @property
+    def start_timeout_seconds(self) -> int:
+        """启动确认超时（秒，只读，委托 Settings）。"""
+
+        return self.settings.start_timeout_seconds
+
+    @property
+    def stop_timeout_seconds(self) -> int:
+        """停止等待超时（秒，只读，委托 Settings）。"""
+
+        return self.settings.stop_timeout_seconds
+
+    @property
+    def sync_interval_seconds(self) -> Optional[int]:
+        """DDNS-GO 同步间隔（秒，只读，委托 Settings）。"""
+
+        return self.settings.sync_interval_seconds
+
+    @property
+    def cache_times(self) -> Optional[int]:
+        """解析缓存次数（只读，委托 Settings）。"""
+
+        return self.settings.cache_times
+
+    @property
+    def dns_servers(self) -> Optional[str]:
+        """自定义 DNS（只读，委托 Settings）。"""
+
+        return self.settings.dns_servers
+
     def _open_process(self, access: int, process_id: int):
         """按权限打开进程句柄；进程不存在时返回 None。"""
 
-        _require_kernel32()
+        return self.process_ops.open_process(access, process_id)
 
-        handle = KERNEL32.OpenProcess(access, False, process_id)
-        if handle:
-            return handle
-
-        # OpenProcess 对已经退出或不存在的 PID 返回 ERROR_INVALID_PARAMETER；
-        # 这是正常竞态，不应当显示成查询错误。
-        if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
-            return None
-        raise _win32_os_error()
-
-    @staticmethod
-    def _query_process_path_from_handle(handle) -> Path:
+    def _query_process_path_from_handle(self, handle) -> Path:
         """通过进程句柄查询完整映像路径。"""
 
-        buffer = ctypes.create_unicode_buffer(32768)
-        size = wintypes.DWORD(len(buffer))
-        if not KERNEL32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-            raise _win32_os_error()
-        return Path(buffer.value)
+        return self.process_ops.query_process_path(handle)
 
     def get_process_path(self, process_id: int) -> Optional[Path]:
         """返回进程的完整路径；进程不存在返回 None，查询失败则抛错。"""
@@ -1323,7 +1677,7 @@ class DdnsController:
         except OSError as exc:
             raise DdnsError(f"无法查询进程 {process_id} 的程序路径：{exc}") from exc
         finally:
-            KERNEL32.CloseHandle(handle)
+            self.process_ops.close_handle(handle)
 
     def process_matches_executable(self, process_id: int) -> bool:
         """核对 PID 是否属于脚本目录中的 ddns-go.exe。"""
@@ -1344,41 +1698,12 @@ class DdnsController:
     def get_listener_process_ids(self) -> List[int]:
         """查询监听 PID；命令失败时抛错，绝不伪造为空监听结果。"""
 
-        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-        netstat_path = system_root / "System32" / "netstat.exe"
-        if not netstat_path.is_file():
-            raise DdnsError("系统组件 netstat.exe 不可用。")
-
-        # 不加 -p tcp：该过滤器只返回 IPv4 表，纯 IPv6 的监听者会整个消失，
-        # 使端口占用检查失真。全表中的 UDP 与非监听行由 LISTENER_PATTERN 排除，
-        # 同一进程的双栈两行由下方的集合去重。
-        try:
-            completed = subprocess.run(
-                [str(netstat_path), "-ano"],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding=locale.getpreferredencoding(False),
-                errors="replace",
-                creationflags=CREATE_NO_WINDOW,
-                timeout=LISTENER_QUERY_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise DdnsError(
-                f"netstat.exe 查询超过 {LISTENER_QUERY_TIMEOUT_SECONDS} 秒。"
-            ) from exc
-        except OSError as exc:
-            raise DdnsError(f"netstat.exe 查询失败：{exc}") from exc
-
-        if completed.returncode != 0:
-            raise DdnsError(f"netstat.exe 查询失败，退出码：{completed.returncode}。")
-
-        return parse_listener_process_ids(completed.stdout.splitlines(), self.port)
+        return self.port_query.query(self.port)
 
     def read_runtime_state(self) -> Tuple[bool, Optional[RuntimeState]]:
-        """委托模块级读取函数，绑定控制器自身状态文件路径。"""
+        """委托状态存储组件读取运行状态文件（默认绑定控制器自身路径）。"""
 
-        return read_runtime_state(self.runtime_state_path)
+        return self.state_store.read()
 
     def _probe_runtime_state(
         self, runtime_state: RuntimeState
@@ -1439,7 +1764,7 @@ class DdnsController:
             corrected = None if ddns_alive else mark_runtime_stopped(runtime_state)
 
         if corrected is not None:
-            write_runtime_state(self.runtime_state_path, corrected)
+            self.state_store.write(corrected)
             return corrected, (ddns_alive, relay_matches, relay_event_matches)
         return runtime_state, (ddns_alive, relay_matches, relay_event_matches)
 
@@ -1803,11 +2128,11 @@ class DdnsController:
                     f"PID {process_id} 已不再属于当前目录的 ddns-go.exe，未停止该进程。"
                 )
 
-            if not KERNEL32.TerminateProcess(handle, 1):
+            if not self.process_ops.terminate_process(handle, 1):
                 raise _win32_error(f"停止进程 {process_id} 失败")
 
             timeout_ms = int(self.stop_timeout_seconds * 1000)
-            wait_result = KERNEL32.WaitForSingleObject(handle, timeout_ms)
+            wait_result = self.process_ops.wait_for_single_object(handle, timeout_ms)
             if wait_result == WAIT_TIMEOUT:
                 raise DdnsError(
                     f"进程 {process_id} 未能在 {self.stop_timeout_seconds} 秒内退出。"
@@ -1816,7 +2141,7 @@ class DdnsController:
                 raise _win32_error(f"等待进程 {process_id} 退出失败")
             return True
         finally:
-            KERNEL32.CloseHandle(handle)
+            self.process_ops.close_handle(handle)
 
     def wait_for_process_exit(self, process_id: int) -> bool:
         """等待已知 PID 退出；进程本已不存在返回 True，超时返回 False。"""
@@ -1828,7 +2153,7 @@ class DdnsController:
         if handle is None:
             return True
         try:
-            wait_result = KERNEL32.WaitForSingleObject(
+            wait_result = self.process_ops.wait_for_single_object(
                 handle, int(self.stop_timeout_seconds * 1000)
             )
             if wait_result == WAIT_OBJECT_0:
@@ -1837,32 +2162,14 @@ class DdnsController:
                 return False
             raise _win32_error(f"等待进程 {process_id} 退出失败")
         finally:
-            KERNEL32.CloseHandle(handle)
+            self.process_ops.close_handle(handle)
 
     def _build_start_arguments(self) -> List[str]:
         """组装 DDNS-GO 的启动参数；配置为 None 的项一律不传，沿用其自身默认值。"""
 
-        arguments = [
-            str(self.executable_path),
-            "-l",
-            f":{self.port}",
-            "-c",
-            str(self.config_path),
-        ]
-        if self.sync_interval_seconds is not None:
-            arguments += ["-f", str(self.sync_interval_seconds)]
-        if self.cache_times is not None:
-            arguments += ["-cacheTimes", str(self.cache_times)]
-        if self.dns_servers is not None:
-            arguments += ["-dns", self.dns_servers]
-        for extra in DDNS_GO_EXTRA_ARGS:
-            if isinstance(extra, str):
-                arguments.append(extra)
-            else:
-                flag, *values = extra
-                arguments.append(flag)
-                arguments.extend(str(value) for value in values)
-        return arguments
+        return self.settings.build_start_arguments(
+            self.executable_path, self.config_path
+        )
 
     def _build_relay_arguments(
         self,
@@ -1974,9 +2281,7 @@ class DdnsController:
                 failures.append(str(exc))
         if saved_state is not None:
             try:
-                write_runtime_state(
-                    self.runtime_state_path, mark_runtime_stopped(saved_state)
-                )
+                self.state_store.write(mark_runtime_stopped(saved_state))
             except DdnsError as exc:
                 failures.append(str(exc))
         if failures:
@@ -2017,9 +2322,9 @@ class DdnsController:
 
         # 先独占创建本次日志名，再清理日志；新日志天然不会进入删除候选。
         started_at = datetime.now().astimezone()
-        log_path = reserve_log_file(self.log_directory, started_at)
-        prune_failures = prune_log_files(
-            self.log_directory, LOG_KEEP_COUNT, log_path
+        log_path = self.log_manager.reserve(started_at)
+        prune_failures = self.log_manager.prune(
+            LOG_KEEP_COUNT, current_path=log_path
         )
         launch_id = str(uuid.uuid4())
         relay_arguments = self._build_relay_arguments(
@@ -2052,7 +2357,7 @@ class DdnsController:
         runtime_state = None
         listener_verified = False
         try:
-            relay_process = subprocess.Popen(relay_arguments, **popen_options)
+            relay_process = self.spawner.spawn(relay_arguments, **popen_options)
             runtime_state = self._wait_for_relay_state(relay_process, launch_id)
             ddns_process_id = runtime_state.ddns_pid
             if ddns_process_id is None:
@@ -2133,9 +2438,7 @@ class DdnsController:
         if state.code == STATE_CODE_STALE_RUNTIME:
             _, saved_state = self.read_runtime_state()
             if saved_state is not None:
-                write_runtime_state(
-                    self.runtime_state_path, mark_runtime_stopped(saved_state)
-                )
+                self.state_store.write(mark_runtime_stopped(saved_state))
                 return ActionResult(
                     "DDNS-GO 当前未运行；运行状态已标记为 stopped。", "yellow"
                 )
@@ -2174,9 +2477,7 @@ class DdnsController:
         # 无论是否实际终止过进程，都按最新状态文件落盘 stopped。
         _, saved_state = self.read_runtime_state()
         if saved_state is not None:
-            write_runtime_state(
-                self.runtime_state_path, mark_runtime_stopped(saved_state)
-            )
+            self.state_store.write(mark_runtime_stopped(saved_state))
         if not stopped_ids:
             return ActionResult("DDNS-GO 与日志转发器已停止。")
         ids_text = ", ".join(str(process_id) for process_id in stopped_ids)
@@ -2218,7 +2519,7 @@ class DdnsController:
         if keep_count < 0:
             return ActionResult("日志保留数量不能为负数。", "yellow")
         # 先统计清理前份数，用于计算实际删除数量。
-        before = len(_list_log_files(self.log_directory))
+        before = len(self.log_manager.list_log_files())
         protected_paths = []
         try:
             state_exists, runtime_state = self.read_runtime_state()
@@ -2235,12 +2536,10 @@ class DdnsController:
             if runtime_log is not None and runtime_log.is_file():
                 protected_paths.append(runtime_log)
         # 清理统一复用 prune_log_files，与启动时保持同一保护/失败语义。
-        failures = prune_log_files(
-            self.log_directory,
-            keep_count,
-            protected_paths=protected_paths,
+        failures = self.log_manager.prune(
+            keep_count, protected_paths=protected_paths
         )
-        deleted = before - len(_list_log_files(self.log_directory))
+        deleted = before - len(self.log_manager.list_log_files())
         if before == 0:
             return ActionResult("日志目录为空，无需清理。", "yellow")
 
@@ -2277,7 +2576,7 @@ def display_width(text: str) -> int:
     )
 
 
-class ConsoleUI:
+class ConsoleUI(IConsoleOutput):
     """标准库控制台界面；终端支持时启用 ANSI 颜色。"""
 
     ANSI_COLORS = {
@@ -2359,7 +2658,7 @@ class ConsoleUI:
     def render(
         self,
         state: DdnsState,
-        controller: DdnsController,
+        controller: IRenderContext,
         last_result: Optional[ActionResult],
     ) -> None:
         """全屏绘制主菜单整帧。"""
@@ -2444,10 +2743,10 @@ class ConsoleUI:
         print(text)
 
 
-class TuiInput:
+class TuiInput(IKeyReader):
     """统一封装控制台输入，供菜单和日志查看会话复用。"""
 
-    def __init__(self, ui: ConsoleUI) -> None:
+    def __init__(self, ui: IConsoleOutput) -> None:
         """绑定当前界面对象。"""
 
         self.ui = ui
@@ -2731,7 +3030,7 @@ def log_view_footer_items() -> Tuple[Tuple[str, str], ...]:
     )
 
 
-def render_log_view_footer(ui: ConsoleUI) -> str:
+def render_log_view_footer(ui: IConsoleOutput) -> str:
     """按配置渲染页脚；逗号用灰色弱化，与黄色按键提示区分。"""
 
     comma = ui.colorize(",", "bright_black")
@@ -2743,7 +3042,7 @@ def render_log_view_footer(ui: ConsoleUI) -> str:
 
 def render_log_viewer(
     controller: DdnsController,
-    ui: ConsoleUI,
+    ui: IConsoleOutput,
     log_path: Path,
     log_kind: str,
     lines: Sequence[str],
@@ -2892,7 +3191,7 @@ class LogViewerSession:
     def __init__(
         self,
         controller: DdnsController,
-        ui: ConsoleUI,
+        ui: IConsoleOutput,
         state: LogViewerState,
         next_key: Callable[[], Optional[str]],
         refresh: Callable[[], Tuple[bool, Optional[ActionResult]]],
@@ -3171,7 +3470,7 @@ class LogViewerSession:
 
 def _run_log_view_loop(
     controller: DdnsController,
-    ui: ConsoleUI,
+    ui: IConsoleOutput,
     log_path: Path,
     log_kind: str,
     reader: LogViewReader,
@@ -3211,7 +3510,7 @@ def _run_log_view_loop(
 def view_runtime_log(
     controller: DdnsController,
     state: DdnsState,
-    ui: ConsoleUI,
+    ui: IConsoleOutput,
 ) -> ActionResult:
     """进入运行时日志查看页；无当前日志时回退到最新历史日志，无日志时显示空占位。"""
 
@@ -3297,7 +3596,7 @@ def view_runtime_log(
 # 按键处理与交互入口
 
 def read_line_number(
-    ui: ConsoleUI,
+    ui: IConsoleOutput,
     prompt_text: str = "跳转到行号: ",
     on_invalid: Optional[Callable[[], None]] = None,
 ) -> Optional[int]:
@@ -3353,7 +3652,7 @@ def read_line_number(
 
 
 def read_immediate_key(
-    ui: ConsoleUI, prompt_text: str = "请选择："
+    ui: IConsoleOutput, prompt_text: str = "请选择："
 ) -> str:
     """在真实控制台读取单键；输入重定向时回退到逐行读取。"""
 
@@ -3395,7 +3694,7 @@ def invoke_menu_action(
 class MenuActionDispatcher:
     """主菜单动作分发器；把按键对应关系和实际控制操作解耦。"""
 
-    def __init__(self, controller: DdnsController, ui: ConsoleUI) -> None:
+    def __init__(self, controller: DdnsController, ui: IConsoleOutput) -> None:
         """绑定控制器与界面，并建立动作名到处理器的映射。"""
 
         self.controller = controller
@@ -3438,7 +3737,7 @@ class MenuActionDispatcher:
 class MainMenuSession:
     """主菜单标准库 TUI 会话，统一管理渲染、输入和动作分发。"""
 
-    def __init__(self, controller: DdnsController, ui: ConsoleUI) -> None:
+    def __init__(self, controller: DdnsController, ui: IConsoleOutput) -> None:
         """创建菜单会话及其共享输入、动作分发器。"""
 
         self.controller = controller
@@ -3481,7 +3780,7 @@ class MainMenuSession:
                 last_result = ActionResult(f"[未预期错误] {exc}", "red")
 
 
-def run_menu(controller: DdnsController, ui: ConsoleUI) -> int:
+def run_menu(controller: DdnsController, ui: IConsoleOutput) -> int:
     """运行标准库 TUI 主菜单；调用方负责持有单实例互斥量。"""
 
     return MainMenuSession(controller, ui).run()
