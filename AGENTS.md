@@ -23,10 +23,10 @@
 - `src/ddns-go_ctl.py`、`src/ddns-go_ctl_py-run.bat`
 - `src/ddns-go_ctl_py-run_abspath.bat_example.bak`，作为使用绝对路径占位符的示例保留
 - `tests/` 下的标准库测试
-- `scripts/release-notes.ps1`
+- `scripts/release-notes.ps1`、`scripts/checksums.ps1`
 - `docs/` 下的项目说明、版本信息和发布说明
 - `.github/` 下的社区规范与工作流
-- `README.md`、`AGENTS.md`、`LICENSE` 和公开的 `.gitignore`
+- `README.md`、`AGENTS.md`、`LICENSE`、公开的 `.gitignore` 和 `.gitattributes`
 
 不得提交以下内容：
 
@@ -34,6 +34,7 @@
 - `ctl-data/`、`__pycache__/`、`*.py[cod]`
 - `build/`、`dist/`、`*.spec`、临时导出文件
 - `_Private/`、`_Private_Archive/`、0_Archive 备份、开发环境元数据
+- `_Release-Assets-Backups/` 及其中的发布产物与校验清单
 - 未经明确要求新增的本机绝对路径；`ddns-go_ctl_py-run_abspath.bat_example.bak` 应使用通用占位路径，不得提交实际环境路径
 
 如果本机存在 `_Private/`，它只能作为本地归档，不得使用 `git add -f`、提交或推送。
@@ -56,14 +57,39 @@
 - 历史版本说明放在 `docs/releases/history/`。
 - `docs/releases/README.md` 是目录规范，不作为 Release 正文。
 - Release 正文使用 `scripts/release-notes.ps1 -Body` 提取。
-- 发布前必须执行 `.\scripts\release-notes.ps1 -Check`。
+- 发布前必须执行 `./scripts/release-notes.ps1 -Check`。
+- 发布资产的 SHA-256 只记录在 `SHA256SUMS.txt` 校验清单中；发布说明的「发布资产」一节记录资产名、大小、构建信息与清单是否随附，不抄写哈希值，避免两处数值漂移。
+- 上一条自 v2.7.1 起适用；更早版本的历史说明保留原有的内联 SHA-256，与已发布的 Release 正文保持一致，不做回溯修改。
 - `main`、Tag 和 Release 由主发布者统一维护，未经明确授权不得修改或推送。
+
+## 发布产物与校验清单
+
+- 本地发布产物与清单存放在 `_Release-Assets-Backups/v<version>_/`，该目录已忽略，只作本机暂存与备份，不得提交或推送。
+- 每个版本目录内只放该版本的 EXE 与它的 `SHA256SUMS.txt`，清单文件名固定。
+- EXE 资产名统一为 `ddns-go_ctl_v<version>_win-amd64-portable.exe`，重命名必须在生成清单之前完成：清单记录文件的当前名称。
+- 清单格式为 GNU coreutils 兼容文本：小写十六进制、两个空格分隔、LF 换行、无 BOM、行内只有裸文件名，且清单不列自身。
+- 生成与校验：
+
+```powershell
+./scripts/checksums.ps1 _Release-Assets-Backups/v<version>_
+./scripts/checksums.ps1 -Verify _Release-Assets-Backups/v<version>_
+./scripts/checksums.ps1 -CheckFormat _Release-Assets-Backups/v<version>_
+```
+
+- 校验清单只提供下载完整性校验，不构成来源签名；未代码签名的版本不声称具备防篡改能力。
+- 上传 Release 时 EXE 与清单一起上传，资产文件名与清单内记录逐字符一致。
 
 ## 开发检查
 
 ```powershell
-python tests\test_ddns_go_ctl.py
-.\scripts\release-notes.ps1 -Check
+python -m unittest discover -s tests -p "test_*.py" -v
+./scripts/release-notes.ps1 -Check
+```
+
+发布 EXE 时追加校验清单检查：
+
+```powershell
+./scripts/checksums.ps1 -Verify _Release-Assets-Backups/v<version>_
 ```
 
 Python 脚本只使用标准库，支持基线为 CPython 3.11 或更高版本。测试不启动真实 DDNS-GO，不触发动态 DNS 更新。
@@ -77,6 +103,7 @@ PowerShell 脚本需要兼容 Windows PowerShell 5.1 与 PowerShell 7，并保�
 - 不提交本地私有归档、内部开发源目录、会话数据或本机路径。
 - 提交前运行公开仓库开发检查。
 - 贡献者流程以 `.github/CONTRIBUTING.md` 为准。
+- 保持 `Settings` 为可调参数的唯一来源，`DdnsController` 的可调参数属性维持只读委托；组件边界继续用 `typing.Protocol` 声明，默认实现只做转发、实际逻辑留在模块级函数。依赖注入位属内部约定，不作为对外稳定 API。
 - 不覆盖或还原用户未要求的工作区改动，改动范围应保持聚焦。
 
 ## 兼容性

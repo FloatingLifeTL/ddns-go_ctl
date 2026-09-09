@@ -3,10 +3,10 @@
 脚本完全使用 Python 标准库，不导入或探测任何第三方 Python 包。
 
 版本与更新时间：
-- 脚本版本：v2.7.1
-  更新时间：2026-08-24-Sun
+- 脚本版本：v2.8.0
+  更新时间：2026-09-09-Wed
 - 脚本定版实测：
-  DDNS-GO 版本：v6.17.5
+  DDNS-GO 版本：v6.17.7
   兼容说明：脚本不绑定 DDNS-GO 具体版本，原则上可用于其他版本，但不保证全部兼容。
 
 功能：
@@ -31,7 +31,8 @@
 
 版本界定：
 - 受支持基线：Windows x86_64、CPython 3.11.x。
-- 现行验证（2026-07-22）：Windows 内核 10.0.26200 AMD64、CPython 3.11.15。
+- 现行验证（2026-09-08）：Windows 11 内核 10.0.26200 AMD64，CPython 3.11.9 与 3.13.13 均实测通过。
+- 定版实测（2026-09-08）：DDNS-GO v6.17.7 后台启动、端口监听、状态落盘、停止归零与日志转发均正常。
 - CPython 3.8 仅通过语法兼容检查，不属于已验证运行时支持范围。
 - 脚本不绑定 DDNS-GO 具体版本，按官方启动参数透传，原则上可用于其他版本，
   但不保证全部兼容。
@@ -44,11 +45,20 @@
   -dns 自动透传，-noweb、-skipVerify、-resetPassword、-s install/uninstall 默认
   不自动透传，确需透传可在 DDNS_GO_EXTRA_ARGS 中显式追加。
 
+源码结构：
+- 可调参数集中在不可变 Settings，是启动参数与超时、间隔等配置的唯一来源；
+  DdnsController 的 port 等属性只读并委托 settings，不要直接赋值或另存一份。
+- 进程操作、端口查询、状态存储、日志管理、子进程创建和界面输出以 typing.Protocol
+  声明边界，默认实现只做转发，实际逻辑仍由模块级函数承担。
+- DdnsController 提供 keyword-only 依赖注入位（process_ops、port_query、
+  state_store、log_manager、spawner），省略时装配默认实现，行为不变。
+- 以上属内部结构约定，不是对外稳定 API；详见 docs/project.md 第 8 节。
+
 目录布局：
 - ctl-data/.ddns_go_config.yaml：配置文件。
 - ctl-data/run/ddns-go_runtime.json：运行状态文件。
 - ctl-data/logs/ddns-go_YYYYMMDD-HHmmss.log：按启动划分的日志。
-配套测试：test_ddns_go_ctl.py（标准库 unittest，不启动 DDNS-GO 本体）。
+配套测试：tests/ 下按 test_*.py 命名的独立模块（标准库 unittest，不启动 DDNS-GO 本体）。
 """
 
 from __future__ import annotations
@@ -163,7 +173,7 @@ LOG_VIEW_DIGITS_ONLY_MESSAGE = "提示：仅数字键有效"
 LOG_VIEW_JUMPING_MESSAGE = "提示：跳行输入中，仅数字键有效"
 LOG_VIEW_JUMP_PAGE_MESSAGE = "提示：跳页输入中，仅数字键有效"
 # 脚本自身版本，与 README.md 保持一致。
-SCRIPT_VERSION = "2.7.1"
+SCRIPT_VERSION = "2.8.0"
 
 # ===== 按键配置 =====
 # 一级菜单与二级菜单统一格式：
@@ -329,7 +339,8 @@ LOG_FILE_PATTERN = re.compile(
 
 # ===== 接口定义（typing.Protocol + Settings）=====
 # 组件边界用 Protocol 声明，具体实现只需结构匹配（鸭子类型）。
-# 实现类一律继续调用本模块的模块级函数/全局，使测试的 mock.patch 拦截路径不变。
+# 实现类一律继续调用本模块的模块级函数/全局，保持默认实现入口单一，
+# 便于替换底层能力，也让测试对模块级函数的拦截路径保持有效。
 
 @dataclass(frozen=True)
 class Settings:
@@ -379,48 +390,69 @@ class Settings:
 class IProcessOperations(Protocol):
     """Win32 原始进程操作；句柄由调用方负责关闭。"""
 
-    def open_process(self, access: int, process_id: int): ...
-    def query_process_path(self, handle) -> Path: ...
-    def terminate_process(self, handle, exit_code: int = 1) -> bool: ...
-    def wait_for_single_object(self, handle, timeout_ms: int) -> int: ...
-    def close_handle(self, handle) -> None: ...
+    def open_process(self, access: int, process_id: int):
+        """按权限打开进程句柄；进程不存在返回 None，其余失败抛 OSError。"""
+
+    def query_process_path(self, handle) -> Path:
+        """通过句柄查询完整映像路径；失败抛 OSError。句柄由调用方持有。"""
+
+    def terminate_process(self, handle, exit_code: int = 1) -> bool:
+        """终止进程；返回 Win32 调用结果，失败文案由调用方按 PID 构造。"""
+
+    def wait_for_single_object(self, handle, timeout_ms: int) -> int:
+        """等待句柄信号或超时，返回 Win32 等待结果。"""
+
+    def close_handle(self, handle) -> None:
+        """关闭句柄；调用方负责在 finally 中恰好调用一次。"""
 
 
 @runtime_checkable
 class IPortQuery(Protocol):
     """端口监听查询；返回监听指定端口的 PID 列表。"""
 
-    def query(self, port: int) -> List[int]: ...
+    def query(self, port: int) -> List[int]:
+        """查询监听指定端口的 PID；查询失败抛 DdnsError，绝不伪造为空结果。"""
 
 
 @runtime_checkable
 class IRuntimeStateStore(Protocol):
     """运行状态文件的读写。"""
 
-    def read(self) -> Tuple[bool, Optional[RuntimeState]]: ...
-    def write(self, state: RuntimeState) -> None: ...
+    def read(self) -> Tuple[bool, Optional[RuntimeState]]:
+        """读取运行状态；文件不存在返回 (False, None)，内容无效抛 DdnsError。"""
+
+    def write(self, state: RuntimeState) -> None:
+        """原子替换写入运行状态；写入失败抛 DdnsError。"""
 
 
 @runtime_checkable
 class ILogManager(Protocol):
     """日志文件预留、清理、列出与最新定位。"""
 
-    def reserve(self, started_at: Optional[datetime] = None) -> Path: ...
+    def reserve(self, started_at: Optional[datetime] = None) -> Path:
+        """独占创建并返回本次日志路径；同秒名称用尽抛 DdnsError。"""
+
     def prune(
         self,
         keep_count: int,
         current_path: Optional[Path] = None,
         protected_paths: Iterable[Path] = (),
-    ) -> List[Path]: ...
-    def list_log_files(self) -> List[Path]: ...
-    def latest(self) -> Optional[Path]: ...
+    ) -> List[Path]:
+        """按时间顺序清理旧日志，返回清理失败的路径；受保护日志不被删除。"""
+
+    def list_log_files(self) -> List[Path]:
+        """列出规范命名的日志文件；目录不可读抛 DdnsError。"""
+
+    def latest(self) -> Optional[Path]:
+        """返回命名最新的一份日志；目录为空返回 None。"""
 
 
 @runtime_checkable
 class IProcessSpawner(Protocol):
     """创建子进程（日志转发器）；返回 Popen 句柄。"""
 
-    def spawn(self, command: Sequence[str], **options) -> subprocess.Popen: ...
+    def spawn(self, command: Sequence[str], **options) -> subprocess.Popen:
+        """创建子进程并返回 Popen 对象；进程生命周期由调用方管理。"""
 
 
 @runtime_checkable
@@ -436,34 +468,45 @@ class IRenderContext(Protocol):
     log_directory: Path
     config_path: Path
 
-    def display_path(self, path: Path) -> str: ...
+    def display_path(self, path: Path) -> str:
+        """把绝对路径格式化为相对运行目录的显示文本。"""
 
 
 @runtime_checkable
 class IConsoleOutput(Protocol):
     """控制台输出能力（着色、整帧渲染、提示、回显）。"""
 
-    def colorize(self, text: str, color: str) -> str: ...
+    def colorize(self, text: str, color: str) -> str:
+        """按颜色包裹文本；终端不支持或颜色未知时原样返回。"""
+
     def render(
         self,
         state: DdnsState,
         controller: IRenderContext,
         last_result: Optional[ActionResult],
-    ) -> None: ...
-    def prompt(self, text: str) -> None: ...
-    def echo(self, text: str) -> None: ...
+    ) -> None:
+        """整帧渲染界面；终端为 TTY 时先清屏与回滚历史。"""
+
+    def prompt(self, text: str) -> None:
+        """输出不带换行的提示文本。"""
+
+    def echo(self, text: str) -> None:
+        """输出单行回显。"""
 
 
 @runtime_checkable
 class IKeyReader(Protocol):
     """单键与数字输入能力。"""
 
-    def read_key(self, prompt_text: str = "请选择：") -> str: ...
+    def read_key(self, prompt_text: str = "请选择：") -> str:
+        """读取单个按键；输入重定向时回退到逐行读取。"""
+
     def read_line_number(
         self,
         prompt_text: str = "跳转到行号: ",
         on_invalid: Optional[Callable[[], None]] = None,
-    ) -> Optional[int]: ...
+    ) -> Optional[int]:
+        """读取目标行号；Esc、X 或空输入返回 None。"""
 
 
 class IoCounters(ctypes.Structure):
@@ -661,7 +704,7 @@ class NetstatPortQuery:
     def query(self, port: int) -> List[int]:
         """查询监听 PID；命令失败时抛错，绝不伪造为空监听结果。"""
 
-        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        system_root = Path(os.environ.get("SystemRoot", r"C:/Windows"))
         netstat_path = system_root / "System32" / "netstat.exe"
         if not netstat_path.is_file():
             raise DdnsError("系统组件 netstat.exe 不可用。")
@@ -1546,8 +1589,8 @@ class DdnsController:
         """校验可调参数并预解析脚本目录下的固定路径。
 
         末尾的 keyword-only 参数是接口隔离的注入点：默认为真实实现，调用方可
-        传入替代实现（mock 或换源）；注入的实现类仍委托模块级函数，保持原测试
-        的 mock.patch 拦截路径不变。
+        传入替代实现（mock 或换源）；注入的实现类仍委托模块级函数，保持默认
+        实现入口单一，测试对模块级函数的拦截路径也不受影响。
         """
 
         if not 1 <= port <= 65535:

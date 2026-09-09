@@ -22,8 +22,8 @@
 可选输出文件；未指定时正文写入 stdout。
 
 .EXAMPLE
-.\scripts\release-notes.ps1 -Check
-.\scripts\release-notes.ps1 -Body -Version v2.7.1
+./scripts/release-notes.ps1 -Check
+./scripts/release-notes.ps1 -Body -Version v2.7.1
 
 .NOTES
 支持平台：Windows。
@@ -60,7 +60,7 @@ if ($Check -and $Body) {
 function Read-ReleaseVersion {
   param([string]$Root)
 
-  $path = Join-Path $Root 'docs\VERSION'
+  $path = Join-Path $Root 'docs/VERSION'
   if (-not (Test-Path -LiteralPath $path)) {
     throw "Missing version file: $path"
   }
@@ -80,7 +80,7 @@ function Assert-ReleaseNoteLayout {
   # 当前版本文件名由 docs/VERSION 的 version 生成，例如 v2.7.1.md。
   $version = Read-ReleaseVersion -Root $Root
   $tag = "v$version"
-  $releasesRoot = Join-Path $Root 'docs\releases'
+  $releasesRoot = Join-Path $Root 'docs/releases'
   if (-not (Test-Path -LiteralPath $releasesRoot)) {
     throw "Missing release-note directory: $releasesRoot"
   }
@@ -146,8 +146,8 @@ function Get-ReleaseBody {
   }
 
   # 当前版本放在 docs/releases/，历史版本放在 history/。
-  $latestPath = Join-Path $Root "docs\releases\$tag.md"
-  $historyPath = Join-Path $Root "docs\releases\history\$tag.md"
+  $latestPath = Join-Path $Root "docs/releases/$tag.md"
+  $historyPath = Join-Path $Root "docs/releases/history/$tag.md"
   $path = if (Test-Path -LiteralPath $latestPath) {
     $latestPath
   } elseif (Test-Path -LiteralPath $historyPath) {

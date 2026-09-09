@@ -1,9 +1,10 @@
 """ddns-go_ctl.py 的标准库测试。
 
-运行：python test_ddns_go_ctl.py
+运行（仓库根目录）：python -m unittest discover -s tests -p "test_*.py" -v
+单文件运行：python tests/test_ddns_go_ctl.py
 验证解析、运行状态、日志转发与进程核验逻辑：不启动 DDNS-GO 本体，不触发动态
 DNS 更新，不读写脚本目录中的真实状态、日志或配置文件（一律使用临时目录）。
-最后编辑：2026-08-11-Tue。
+最后编辑：2026-09-08-Tue。
 """
 
 from __future__ import annotations
@@ -645,7 +646,7 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
     @staticmethod
     def make_fake_ddns(directory):
         source_cmd = (
-            Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            Path(os.environ.get("SystemRoot", r"C:/Windows"))
             / "System32"
             / "cmd.exe"
         )

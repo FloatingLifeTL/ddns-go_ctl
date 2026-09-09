@@ -21,17 +21,19 @@
 
 ## 提交前检查
 
-1. 阅读 `README.md`、`docs/project.md`，并阅读脚本顶部 `DDNS_GO_PARAMS`、`MENU_KEY_MAPPINGS` 和 `LOG_VIEW_KEY_MAPPINGS`。
-2. 保持功能、文档和脚本顶部配置区一致。
+1. 阅读 `README.md`、`docs/project.md`（尤其第 8 节源码结构与接口边界），并阅读脚本顶部 `DDNS_GO_PARAMS`、`Settings`、`MENU_KEY_MAPPINGS` 和 `LOG_VIEW_KEY_MAPPINGS`。
+2. 保持功能、文档和脚本顶部配置区一致。可调参数只改 `DDNS_GO_PARAMS` 与 `DDNS_GO_EXTRA_ARGS`；`DdnsController` 的 `port` 等属性是只读委托，不要直接赋值。
 3. 新增或修改用户可见行为时，补充对应测试。
 4. 运行全部测试：
 
 ```bat
-python tests\test_ddns_go_ctl.py
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+`tests/` 下按 `test_*.py` 命名的是独立测试模块，上述发现命令会一次跑完；新增测试文件放入该目录即可自动纳入，无需改动 CI 配置。
+
 5. 检查 `.gitignore`，确保构建产物、日志、可执行文件和本地路径不会进入公开副本。
-6. 用户可见变化同步更新 `docs/releases/v<version>.md`；发布 EXE 时同时记录附件大小、SHA-256、Python/PyInstaller 版本和是否代码签名。
+6. 用户可见变化同步更新 `docs/releases/v<version>.md`；发布 EXE 时同时记录附件名称、大小、Python/PyInstaller 版本和是否代码签名，并为每个产物生成 `SHA256SUMS.txt` 校验清单一并上传。
 7. 更新 `docs/THIRD_PARTY_NOTICES.md`，如果外部依赖范围发生变化。
 
 ## 提交说明
