@@ -32,7 +32,7 @@ ddns-go_ctl.exe
 
 也可以直接双击 `ddns-go_ctl.exe`。
 
-当前可下载的最新发布版本仍是 `v2.7.1`，其发布资产的构建信息与大小见 [v2.7.1 发布说明](./docs/releases/history/v2.7.1.md)，SHA-256 以 Release 附带的 `SHA256SUMS.txt` 校验清单为准。`v2.8.0` 的发布资产已在本地构建并通过验证，见 [v2.8.0 发布说明](./docs/releases/v2.8.0.md)，尚未创建 GitHub Release。
+当前最新发布版本是 `v2.8.0`，其发布资产的构建信息与大小见 [v2.8.0 发布说明](./docs/releases/v2.8.0.md)，SHA-256 以 Release 附带的 `SHA256SUMS.txt` 校验清单为准。上一版本 `v2.7.1` 见 [v2.7.1 发布说明](./docs/releases/history/v2.7.1.md)。
 
 下载后可核对校验清单：Release 附带的 `SHA256SUMS.txt` 采用 GNU coreutils 格式，可用 `sha256sum --check --strict SHA256SUMS.txt` 直接校验；Windows 上可用 `certutil -hashfile <文件名> SHA256` 与清单值比对（`certutil` 输出大写，比对时忽略大小写）。清单只提供完整性校验，不构成来源签名。
 
