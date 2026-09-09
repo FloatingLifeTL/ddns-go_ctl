@@ -1,6 +1,7 @@
 """接口隔离改进版的专项测试。
 
-运行：python test_interface_isolation.py
+运行（仓库根目录）：python -m unittest discover -s tests -p "test_*.py" -v
+单文件运行：python tests/test_interface_isolation.py
 验证三件事：
 1. 每个 Protocol 都被具体实现结构性满足（isinstance 通过）。
 2. Settings 仍引用模块级 DDNS_GO_EXTRA_ARGS，mock 拦截路径不变。
@@ -8,7 +9,7 @@
    且不注入时默认装配真实实现、行为不变。
 
 与 test_ddns_go_ctl.py 使用同一加载方式，共享同一份回归基线。
-最后编辑：2026-08-25。
+最后编辑：2026-09-08-Tue。
 """
 
 from __future__ import annotations

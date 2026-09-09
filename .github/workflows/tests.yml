@@ -21,8 +21,8 @@ jobs:
 
       - name: Check release-note layout
         shell: pwsh
-        run: .\scripts\release-notes.ps1 -Check
+        run: ./scripts/release-notes.ps1 -Check
 
       - name: Run unittest suite
         shell: pwsh
-        run: python tests\test_ddns_go_ctl.py
+        run: python -m unittest discover -s tests -p "test_*.py" -v

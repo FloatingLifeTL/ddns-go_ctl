@@ -1,0 +1,12 @@
+# 统一换行符：仓库内文本文件以 LF 存储，也以 LF 检出。
+# 本机 core.autocrlf=true 会让检出结果变成 CRLF，此文件用于覆盖该行为。
+* text=auto eol=lf
+
+# 批处理与示例文件显式声明为文本，避免被自动探测误判。
+# 实测 cmd.exe 能正常执行 LF 换行的批处理（含 goto 标签）。
+*.bat text eol=lf
+*.bak text eol=lf
+*.ps1 text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
