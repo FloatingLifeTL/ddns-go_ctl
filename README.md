@@ -2,11 +2,11 @@
 
 `ddns-go_ctl` 是一个面向 Windows 的 DDNS-GO 外部管理工具，用于启动、停止、查看状态、打开管理页面和查看运行时日志。
 
-当前版本：`2.8.0`
+当前版本记录在 [docs/VERSION](./docs/VERSION)。
 
 本项目不包含、不修改、不打包 `ddns-go.exe`。DDNS-GO 可执行文件需要从官方 Releases 单独获取。
 
-完整功能说明见 [项目说明](./docs/project.md)，版本发布说明见 [Release Note 目录](./docs/releases/README.md)。
+完整功能说明见 [docs/project.md](./docs/project.md)，GitHub Releases 发布说明正文的仓库内备份见 [docs/releases/README.md](./docs/releases/README.md)。
 
 ## 部署说明
 
@@ -32,7 +32,7 @@ ddns-go_ctl.exe
 
 也可以直接双击 `ddns-go_ctl.exe`。
 
-当前最新发布版本是 `v2.8.0`，其发布资产的构建信息与大小见 [v2.8.0 发布说明](./docs/releases/v2.8.0.md)，SHA-256 以 Release 附带的 `SHA256SUMS.txt` 校验清单为准。上一版本 `v2.7.1` 见 [v2.7.1 发布说明](./docs/releases/history/v2.7.1.md)。
+已发布版本、发布说明正文和下载附件以 [GitHub Releases](https://github.com/FloatingLifeTL/ddns-go_ctl/releases) 为准。仓库内的发布说明正文入口见 [docs/releases/README.md](./docs/releases/README.md)，用于留存可直接上传的正文，不备份发布附件。
 
 下载后可核对校验清单：Release 附带的 `SHA256SUMS.txt` 采用 GNU coreutils 格式，可用 `sha256sum --check --strict SHA256SUMS.txt` 直接校验；Windows 上可用 `certutil -hashfile <文件名> SHA256` 与清单值比对（`certutil` 输出大写，比对时忽略大小写）。清单只提供完整性校验，不构成来源签名。
 
@@ -66,6 +66,7 @@ python ddns-go_ctl.py
 - 支持系统：Windows x86_64。
 - 发布版 EXE：无需安装 Python。
 - 源码方式：需要 CPython 3.11 或更高版本，且 `python` 已加入命令提示符的 `PATH`。
+- 源码方式仅使用 Python 标准库，不需要安装第三方 Python 包。
 
 ### 运行目录
 
@@ -119,11 +120,9 @@ DDNS-GO 运行目录/
 │   ├── THIRD_PARTY_NOTICES.md
 │   └── releases/
 │       ├── README.md
-│       ├── v2.8.0.md
+│       ├── v<version>.md
 │       └── history/
-│           ├── v2.7.1.md
-│           ├── v2.7.0.md
-│           └── v2.6.3.md
+│           └── v<version>.md
 ├── tests/
 │   ├── test_ddns_go_ctl.py
 │   └── test_interface_isolation.py
@@ -139,6 +138,7 @@ DDNS-GO 运行目录/
 - `src/` 保存源码入口，不是运行目录。
 - `AGENTS.md` 保存公开仓库维护、目录边界、版本与开发检查规范。
 - `scripts/` 保存发布说明与校验清单辅助脚本，不是 DDNS-GO 运行时目录。
+- `docs/releases/` 保存可直接用于 GitHub Releases 的发布说明正文及其仓库内备份；目录树中的 `v<version>.md` 为版本文件名示意。
 - `ddns-go_ctl_py-run_abspath.bat_example.bak` 是绝对路径版启动脚本示例；`.bak` 本身不参与启动，使用方式见上方“源码方式”。
 - `dist/`、`build/`、`_Private/`、`_Release-Assets-Backups/` 和运行时 `ctl-data/` 不纳入公开仓库。
 
@@ -161,6 +161,6 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 ## 许可证
 
-本项目源码使用 [MIT License](./LICENSE)。DDNS-GO 的上游许可证和第三方声明见 [THIRD_PARTY_NOTICES.md](./docs/THIRD_PARTY_NOTICES.md)。
+本项目源码使用 MIT License，许可证见 [LICENSE](./LICENSE)。DDNS-GO 的上游许可证和第三方声明见 [docs/THIRD_PARTY_NOTICES.md](./docs/THIRD_PARTY_NOTICES.md)。
 
-安全报告方式见 [SECURITY.md](./.github/SECURITY.md)，贡献方式见 [CONTRIBUTING.md](./.github/CONTRIBUTING.md)。
+安全报告方式见 [.github/SECURITY.md](./.github/SECURITY.md)，贡献方式见 [.github/CONTRIBUTING.md](./.github/CONTRIBUTING.md)。

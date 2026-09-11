@@ -26,9 +26,11 @@
 只校验清单格式。
 
 .EXAMPLE
-./scripts/checksums.ps1 _Release-Assets-Backups/v2.8.0_
-./scripts/checksums.ps1 -Verify _Release-Assets-Backups/v2.8.0_
-./scripts/checksums.ps1 -CheckFormat _Release-Assets-Backups/v2.8.0_
+将 v<version> 替换为实际版本目录名：
+
+./scripts/checksums.ps1 _Release-Assets-Backups/v<version>_
+./scripts/checksums.ps1 -Verify _Release-Assets-Backups/v<version>_
+./scripts/checksums.ps1 -CheckFormat _Release-Assets-Backups/v<version>_
 
 .NOTES
 支持平台：Windows。
