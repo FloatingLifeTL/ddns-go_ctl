@@ -16,14 +16,14 @@
 提取版本说明正文并输出到 stdout 或 -OutputPath 指定文件。
 
 .PARAMETER Version
-要处理的版本，例如 v2.7.1；省略时读取 docs/VERSION。
+要处理的版本，例如 v<version>；省略时读取 docs/VERSION。
 
 .PARAMETER OutputPath
 可选输出文件；未指定时正文写入 stdout。
 
 .EXAMPLE
 ./scripts/release-notes.ps1 -Check
-./scripts/release-notes.ps1 -Body -Version v2.7.1
+./scripts/release-notes.ps1 -Body -Version v<version>
 
 .NOTES
 支持平台：Windows。
@@ -77,7 +77,7 @@ function Read-ReleaseVersion {
 function Assert-ReleaseNoteLayout {
   param([string]$Root)
 
-  # 当前版本文件名由 docs/VERSION 的 version 生成，例如 v2.7.1.md。
+  # 当前版本文件名由 docs/VERSION 的 version 生成，例如 v<version>.md。
   $version = Read-ReleaseVersion -Root $Root
   $tag = "v$version"
   $releasesRoot = Join-Path $Root 'docs/releases'
@@ -138,7 +138,7 @@ function Assert-ReleaseNoteLayout {
 function Get-ReleaseBody {
   param([string]$Root, [string]$Version)
 
-  # 无论用户传 v2.7.1 还是 2.7.1，统一成带 v 的 Tag。
+  # 无论用户传带 v 还是不带 v 的版本号，统一成带 v 的 Tag。
   $tag = if ($Version.StartsWith('v', [System.StringComparison]::OrdinalIgnoreCase)) {
     $Version
   } else {

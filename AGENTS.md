@@ -55,10 +55,11 @@
 - `docs/VERSION`、`src/ddns-go_ctl.py` 中的 `SCRIPT_VERSION`、README 当前版本和当前发布说明必须一致。
 - 当前版本说明固定为 `docs/releases/v<version>.md`。
 - 历史版本说明放在 `docs/releases/history/`。
+- `docs/releases/` 中的版本 Markdown 文件必须是可直接上传到 GitHub Releases 的正式正文，同时作为仓库内备份；不得将其作为草稿或仅供内部使用的文件。
 - `docs/releases/README.md` 是目录规范，不作为 Release 正文。
 - Release 正文使用 `scripts/release-notes.ps1 -Body` 提取。
 - 发布前必须执行 `./scripts/release-notes.ps1 -Check`。
-- 发布资产的 SHA-256 只记录在 `SHA256SUMS.txt` 校验清单中；发布说明的「发布资产」一节记录资产名、大小、构建信息与清单是否随附，不抄写哈希值，避免两处数值漂移。
+- 发布说明只声明随 Release 上传的资产名和校验清单；资产大小、构建信息与 SHA-256 以 `SHA256SUMS.txt` 和发布页为准，不再写入发布说明，避免与清单重复。
 - 上一条自 v2.7.1 起适用；更早版本的历史说明保留原有的内联 SHA-256，与已发布的 Release 正文保持一致，不做回溯修改。
 - `main`、Tag 和 Release 由主发布者统一维护，未经明确授权不得修改或推送。
 

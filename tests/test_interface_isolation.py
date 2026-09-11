@@ -1,15 +1,19 @@
-"""接口隔离改进版的专项测试。
+"""控制器接口边界、配置单一来源与依赖注入的专项测试。
 
 运行（仓库根目录）：python -m unittest discover -s tests -p "test_*.py" -v
 单文件运行：python tests/test_interface_isolation.py
+测试基线：Windows x86_64、CPython 3.11+，仅使用标准库；实测版本见源码顶部。
+
 验证三件事：
-1. 每个 Protocol 都被具体实现结构性满足（isinstance 通过）。
+1. 以 isinstance 检查所列实现的 Protocol 成员存在性，不代替签名与行为验证。
 2. Settings 仍引用模块级 DDNS_GO_EXTRA_ARGS，mock 拦截路径不变。
 3. DdnsController 的 keyword-only 依赖注入点可换源（mock 实现生效），
    且不注入时默认装配真实实现、行为不变。
 
-与 test_ddns_go_ctl.py 使用同一加载方式，共享同一份回归基线。
-最后编辑：2026-09-08-Tue。
+与 test_ddns_go_ctl.py 分别按路径加载同一份源码，不执行其交互入口。
+依赖注入用例以 mock 隔离进程操作；默认实现冒烟用例会查询当前解释器的真实
+进程路径。文件写入限于临时目录，不启动 DDNS-GO，也不触发动态 DNS 更新。
+最后编辑：2026-09-11-Fri。
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ def load_controller_module():
 
     spec = importlib.util.spec_from_file_location("ddns_go_ctl", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
+    # 与主测试一致：先注册模块，dataclass 才能按模块名解析注解。
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
@@ -41,7 +46,7 @@ ctl = load_controller_module()
 
 
 def make_running_state(**overrides):
-    """构造一份合法的 running 运行状态，供注入测试使用。"""
+    """构造默认合法的 running 状态；可覆盖字段，虚拟 PID 不对应实际启动进程。"""
 
     fields = dict(
         schema_version=ctl.RUNTIME_SCHEMA_VERSION,
@@ -58,14 +63,18 @@ def make_running_state(**overrides):
 
 
 class TemporaryDirectoryMixin:
+    """为注入测试隔离文件写入；需与提供 addCleanup 的 unittest.TestCase 混用。"""
+
     def make_directory(self):
+        """返回独立临时目录，并在用例结束（含断言失败）时清理。"""
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         return Path(temporary.name)
 
 
 class ProtocolConformanceTests(unittest.TestCase):
-    """具体实现结构满足对应 Protocol：isinstance 直接可查。"""
+    """检查默认实现的协议成员、配置委托和注入参数位置；不在此执行真实启停。"""
 
     def test_infrastructure_implementations_satisfy_protocols(self):
         self.assertIsInstance(ctl.Win32ProcessOperations(), ctl.IProcessOperations)
@@ -86,7 +95,7 @@ class ProtocolConformanceTests(unittest.TestCase):
         self.assertIsInstance(controller, ctl.IRenderContext)
 
     def test_tunable_attributes_are_readonly_and_delegate_to_settings(self):
-        # 可调参数只读且与 Settings 同源：改 Settings 生效，直接赋值应被拒绝。
+        # 这里检查值同源与拒绝直接赋值；整体替换 Settings 的效果由 SettingsTests 验证。
         controller = ctl.DdnsController(
             Path(tempfile.gettempdir()), port=9876, dns_servers="1.1.1.1,8.8.8.8"
         )
@@ -135,6 +144,7 @@ class SettingsTests(unittest.TestCase):
         self.assertNotIn("-dns", arguments)
 
     def test_extra_args_reference_module_global_at_call_time(self):
+        # 先创建 Settings 再 patch 全局参数，才能排除构造时已缓存参数的实现。
         settings = ctl.Settings(port=9876)
         with mock.patch.object(
             ctl, "DDNS_GO_EXTRA_ARGS", (("-noweb",), ("-skipVerify",))
@@ -164,7 +174,12 @@ class SettingsTests(unittest.TestCase):
 
 
 class DependencyInjectionTests(TemporaryDirectoryMixin, unittest.TestCase):
-    """注入 mock 实现时控制器确实把调用路由到注入对象上。"""
+    """核对依赖调用参数、返回值和资源释放，防止控制器绕过注入对象。
+
+    启停用例替换状态查询、等待与创建能力，不操作虚拟 PID；
+    test_default_controller_uses_real_process_query 刻意保留默认实现，
+    作为当前解释器路径查询的 Windows 冒烟测试。
+    """
 
     def test_get_listener_process_ids_delegates_to_injected_port_query(self):
         port_query = mock.Mock()
@@ -180,6 +195,7 @@ class DependencyInjectionTests(TemporaryDirectoryMixin, unittest.TestCase):
 
     def test_get_process_path_delegates_to_injected_process_ops(self):
         process_ops = mock.Mock()
+        # 不透明哨兵没有系统句柄语义；查询与释放必须原样交回注入对象。
         handle = object()
         process_ops.open_process.return_value = handle
         process_ops.query_process_path.return_value = Path("C:/fake/ddns-go.exe")
@@ -208,9 +224,12 @@ class DependencyInjectionTests(TemporaryDirectoryMixin, unittest.TestCase):
 
         state_store.read.assert_called_once_with()
         self.assertTrue(exists)
+        # 用身份断言确认控制器原样返回存储提供的对象，而非重新构造一个值相等的状态。
         self.assertIs(loaded, running_state)
 
     def test_stop_writes_through_injected_state_store(self):
+        """模拟受管进程已安全退出，只验证 stopped 状态通过注入存储写回。"""
+
         running_state = make_running_state()
         state_store = mock.Mock()
         state_store.read.return_value = (True, running_state)
@@ -241,6 +260,8 @@ class DependencyInjectionTests(TemporaryDirectoryMixin, unittest.TestCase):
         self.assertIsNone(written.ddns_pid)
 
     def test_clean_old_logs_delegates_to_injected_log_manager(self):
+        """固定清理前后列表，仅验证委托参数和结果颜色，不验证实际删除数量。"""
+
         log_manager = mock.Mock()
         log_manager.list_log_files.return_value = [
             Path("a.log"),
@@ -257,13 +278,17 @@ class DependencyInjectionTests(TemporaryDirectoryMixin, unittest.TestCase):
         self.assertEqual(result.color, "green")
 
     def test_start_delegates_relay_spawn_to_injected_spawner(self):
+        """注入假转发器及成功的启动确认，验证后台选项确实交给注入 spawner。"""
+
         spawner = mock.Mock()
         controller = ctl.DdnsController(self.make_directory(), spawner=spawner)
+        # 空 EXE 仅作占位；本用例通过 mock 提供状态并拦截进程创建，不执行它。
         controller.executable_path.touch()
         runtime_state = make_running_state()
         stopped_state = controller.new_state(
             "Stopped", "未运行", "test", "bright_black"
         )
+        # 转发器 PID 为 5432，状态中的 DDNS-GO PID 为 4321；监听确认必须使用后者。
         fake_relay = mock.Mock(pid=5432)
         fake_relay.poll.return_value = None
         spawner.spawn.return_value = fake_relay
@@ -296,5 +321,6 @@ class DependencyInjectionTests(TemporaryDirectoryMixin, unittest.TestCase):
         self.assertTrue(str(process_path).casefold().endswith("python.exe"))
 
 
+# 直接运行时执行本文件用例；被 discover 导入时不额外启动一轮测试。
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,15 @@
-"""ddns-go_ctl.py 的标准库测试。
+"""ddns-go_ctl.py 的行为回归与 Windows 集成测试。
 
 运行（仓库根目录）：python -m unittest discover -s tests -p "test_*.py" -v
 单文件运行：python tests/test_ddns_go_ctl.py
-验证解析、运行状态、日志转发与进程核验逻辑：不启动 DDNS-GO 本体，不触发动态
-DNS 更新，不读写脚本目录中的真实状态、日志或配置文件（一律使用临时目录）。
-最后编辑：2026-09-08-Tue。
+测试基线：Windows x86_64、CPython 3.11+，仅使用标准库；实测版本见源码顶部。
+
+覆盖参数解析、状态文件、日志、进程安全以及菜单和日志查看页交互。
+文件写入限于临时目录，不读写已部署实例的配置、日志或状态，不启动真实 DDNS-GO。
+部分集成用例会启动临时 cmd.exe 副本或 Python 子进程，并使用真实 Win32 句柄、
+命名事件和 netstat 查询；等待用的 ping 仅访问回环地址，不触发动态 DNS 更新。
+这些用例包含退出与清理逻辑，不能把整套测试视为纯 mock 或跨平台测试。
+最后编辑：2026-09-11-Fri。
 """
 
 from __future__ import annotations
@@ -50,28 +55,48 @@ def mapping_hint(mappings, action):
 
 
 class TtyStream:
-    """模拟 TTY stdout；记录每次 write 调用以便断言整帧单次写入。"""
+    """模拟 TTY stdout；chunks 按 write 调用保存，不按换行拆分。
+
+    整帧渲染用例可按 chunks 的顺序断言每帧；逐键输入用例也会记录提示与回显，
+    因而不能一律把一个 chunk 当作一帧。本对象不向真实终端输出。
+    """
 
     def __init__(self):
+        """创建独立的输出记录，避免不同用例混入彼此的内容。"""
+
         self.chunks = []
 
     def write(self, text):
+        """保留一次写入的边界，供整帧输出断言使用。"""
+
         self.chunks.append(text)
 
     def flush(self):
+        """内存记录没有待刷新的外部输出，此处只满足流接口。"""
+
         pass
 
     def isatty(self):
+        """强制走控制台分支，不依赖运行测试的终端类型。"""
+
         return True
 
     def getvalue(self):
+        """合并全部写入内容，供不关注调用边界的文本断言使用。"""
+
         return "".join(self.chunks)
 
 
 class TemporaryControllerMixin:
-    """所有用例都在临时目录上操作，避免碰到现役的运行状态与日志。"""
+    """为使用此辅助方法的用例提供独立运行目录；需与 unittest.TestCase 混用。"""
 
     def make_controller(self, **kwargs):
+        """透传控制器参数，并注册用例结束时的临时目录清理。
+
+        阅读器等资源应在创建后再注册关闭回调，利用 addCleanup 的逆序执行，
+        保证先释放句柄、再删除目录。
+        """
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         return ctl.DdnsController(Path(temporary.name), **kwargs)
@@ -131,6 +156,8 @@ class ParseListenerTests(unittest.TestCase):
 
 
 class NormalizedPathTests(unittest.TestCase):
+    """Windows 路径比较忽略大小写，并消解分隔符与上级目录写法差异。"""
+
     def test_case_and_separators_are_normalized(self):
         left = ctl.normalized_path(Path(r"C:\Temp\Sub\..\ddns-go.exe"))
         right = ctl.normalized_path(Path(r"c:\temp\DDNS-GO.EXE"))
@@ -138,6 +165,8 @@ class NormalizedPathTests(unittest.TestCase):
 
 
 class ControllerValidationTests(TemporaryControllerMixin, unittest.TestCase):
+    """控制器构造时拒绝无效配置；None 仍可表示沿用可选参数默认值。"""
+
     def test_port_range_is_enforced(self):
         for bad_port in (0, 65536, -1):
             with self.subTest(port=bad_port):
@@ -322,6 +351,8 @@ class RuntimeStateTests(TemporaryControllerMixin, unittest.TestCase):
 
     @staticmethod
     def make_state(**changes):
+        """构造固定时间与虚拟 PID 的状态样本；changes 覆盖字段，不查询真实进程。"""
+
         values = {
             "schema_version": ctl.RUNTIME_SCHEMA_VERSION,
             "launch_id": "11111111-2222-4333-8444-555555555555",
@@ -421,6 +452,8 @@ class RuntimeStateTests(TemporaryControllerMixin, unittest.TestCase):
 
 
 class LogFileTests(unittest.TestCase):
+    """在临时目录验证日志命名、保留数量和保护规则；内存流验证逐字节转发。"""
+
     def test_default_keep_count_is_15(self):
         self.assertEqual(ctl.LOG_KEEP_COUNT, 15)
 
@@ -539,6 +572,7 @@ class LogFileTests(unittest.TestCase):
             )
             path.write_bytes(b"")
 
+        # 故意把最旧文件标为当前日志；保留它必须靠保护规则，而不是恰好按时间保留。
         runtime_log = controller.log_directory / "ddns-go_20260803-000001.log"
         runtime_state = ctl.RuntimeState(
             schema_version=ctl.RUNTIME_SCHEMA_VERSION,
@@ -628,6 +662,7 @@ class LogFileTests(unittest.TestCase):
         log_stream = io.BytesIO()
         console_stream = io.BytesIO()
 
+        # 小块读取会切开中文 UTF-8 字节序列；转发器必须按字节搬运，不能分块解码。
         ctl.relay_output(io.BytesIO(payload), log_stream, console_stream, chunk_size=3)
 
         self.assertEqual(log_stream.getvalue(), payload)
@@ -635,7 +670,11 @@ class LogFileTests(unittest.TestCase):
 
     def test_log_write_failure_is_not_swallowed(self):
         class FailingStream(io.BytesIO):
+            """在写入边界注入磁盘故障，无需占满真实磁盘。"""
+
             def write(self, value):
+                """拒绝任何写入，确认转发器将错误交给上层清理逻辑。"""
+
                 raise OSError("disk full")
 
         with self.assertRaisesRegex(OSError, "disk full"):
@@ -643,8 +682,20 @@ class LogFileTests(unittest.TestCase):
 
 
 class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
+    """验证转发器生命周期：参数用例使用 mock，集成用例实际创建替身进程。
+
+    替身只执行输出或回环等待命令；真实事件、Job Object 与日志文件用于验证
+    输出交接和退出清理，不运行 DDNS-GO 或访问 DNS 服务。
+    """
+
     @staticmethod
     def make_fake_ddns(directory):
+        """在用例临时目录复制 cmd.exe 为 ddns-go.exe，并返回绝对路径。
+
+        转发器要求命令首项匹配该路径，故用重命名副本保留真实路径核验；
+        副本仍是命令解释器，不模拟 DDNS-GO 的业务行为。
+        """
+
         source_cmd = (
             Path(os.environ.get("SystemRoot", r"C:/Windows"))
             / "System32"
@@ -667,6 +718,8 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
         self.assertEqual(event.wait(), ctl.WAIT_OBJECT_0)
 
     def test_background_and_foreground_use_expected_console_flags(self):
+        """拦截进程创建和启动确认，只核对窗口与输出选项，不弹出真实前台窗口。"""
+
         for hidden, expected_flag in (
             (True, ctl.CREATE_NO_WINDOW),
             (False, ctl.CREATE_NEW_CONSOLE),
@@ -773,6 +826,8 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
         self.assertEqual(result.color, "yellow")
 
     def test_relay_integration_captures_stdout_and_stderr_without_ddns(self):
+        """用替身进程分别输出两条流，验证真实转发、日志落盘和正常退出后的状态。"""
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         directory = Path(temporary.name).resolve()
@@ -822,6 +877,8 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
         self.assertIsNone(stopped_state.log_file)
 
     def test_job_close_terminates_assigned_process(self):
+        """把真实 Python 等待进程加入 Job，验证关闭 Job 会终止它。"""
+
         sleeper = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdin=subprocess.DEVNULL,
@@ -838,6 +895,7 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
             sleeper.wait(timeout=3)
             self.assertIsNotNone(sleeper.returncode)
         finally:
+            # 断言或 Job 装配失败时也要回收测试进程，避免等满 30 秒或留下后台进程。
             if job is not None:
                 job.close()
             if sleeper.poll() is None:
@@ -845,6 +903,8 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
                 sleeper.wait()
 
     def test_log_failure_kills_child_and_records_failed_state(self):
+        """只注入输出故障，保留真实子进程和状态写入，验证故障后进程确已退出。"""
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         directory = Path(temporary.name).resolve()
@@ -893,6 +953,8 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
         self.assertTrue(controller.wait_for_process_exit(runtime_state.ddns_pid))
 
     def test_stop_event_ends_relay_and_retains_stopped_state(self):
+        """从独立转发器进程验证命名事件停止，并保留日志及清空后的状态文件。"""
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         directory = Path(temporary.name).resolve()
@@ -931,6 +993,8 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
         )
 
         def cleanup_relay():
+            """等待或断言失败时回收测试转发器，随后才由外层清理临时目录。"""
+
             if relay.poll() is None:
                 relay.kill()
                 relay.wait(timeout=5)
@@ -942,6 +1006,7 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
             / ctl.RUNTIME_STATE_DIRECTORY_NAME
             / ctl.RUNTIME_STATE_NAME
         )
+        # 先确认本次 launch_id 的运行状态，不能把旧状态或仅有事件句柄视为启动完成。
         deadline = time.monotonic() + ctl.START_TIMEOUT_SECONDS
         while True:
             state_exists, runtime_state = ctl.read_runtime_state(runtime_path)
@@ -957,6 +1022,7 @@ class RelayLifecycleTests(TemporaryControllerMixin, unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "等待运行状态超时")
             time.sleep(0.05)
 
+        # running 发布早于日志搬运；等待内容实际落盘后再停止，避免调度时序导致空日志。
         deadline = time.monotonic() + ctl.START_TIMEOUT_SECONDS
         while b"relay-running" not in log_path.read_bytes():
             if relay.poll() is not None:
@@ -1011,6 +1077,7 @@ class ProcessIdentityTests(TemporaryControllerMixin, unittest.TestCase):
             stderr=subprocess.DEVNULL,
             creationflags=ctl.CREATE_NO_WINDOW,
         )
+        # addCleanup 逆序执行：先终止测试等待进程，再 wait 回收，避免清理时阻塞。
         self.addCleanup(sleeper.wait)
         self.addCleanup(sleeper.kill)
 
@@ -1021,6 +1088,12 @@ class ProcessIdentityTests(TemporaryControllerMixin, unittest.TestCase):
 
 
 class StateTests(TemporaryControllerMixin, unittest.TestCase):
+    """验证显示路径、状态核对与启停边界；同时检查返回状态和必要的状态落盘。
+
+    部分用例读取真实进程与端口信息，其他用例注入固定探测结果；空 EXE 文件
+    仅满足存在性检查，不能作为真实 DDNS-GO 启动。
+    """
+
     def test_display_path_uses_relative_form(self):
         controller = self.make_controller()
         path = (
@@ -1037,8 +1110,12 @@ class StateTests(TemporaryControllerMixin, unittest.TestCase):
     def test_display_path_falls_back_when_relative_fails(self):
         controller = self.make_controller()
         path = Path("C:/somewhere/else.exe")
+        # 强制进入跨盘回退分支，不要求测试机器实际具有第二个盘符。
         with mock.patch.object(ctl.os.path, "relpath", side_effect=ValueError):
-            self.assertEqual(controller.display_path(path), str(path))
+            self.assertEqual(
+                controller.display_path(path),
+                str(path).replace(os.sep, "/"),
+            )
 
     def test_missing_executable_is_reported_first(self):
         controller = self.make_controller()
@@ -1090,6 +1167,8 @@ class StateTests(TemporaryControllerMixin, unittest.TestCase):
         self.assertIsNone(state.log_path)
 
     def test_stopped_state_with_listener_does_not_crash_log_resolution(self):
+        """状态已清空但端口仍有受管监听者时，应报日志异常，不能把空日志路径当文件。"""
+
         controller = self.make_controller(port=54321)
         controller.executable_path.touch()
         stopped = ctl.mark_runtime_stopped(RuntimeStateTests.make_state())
@@ -1218,6 +1297,8 @@ class StateTests(TemporaryControllerMixin, unittest.TestCase):
         self.assertEqual(state.title, "状态异常，日志链路已失效")
 
     def test_get_state_reuses_precomputed_runtime_probe(self):
+        """本轮已核验的 PID 复用探测结果，避免重复查询带来前后不一致。"""
+
         controller = self.make_controller()
         controller.executable_path.touch()
         runtime_state = RuntimeStateTests.make_state()
@@ -1305,7 +1386,7 @@ class StateTests(TemporaryControllerMixin, unittest.TestCase):
 
 
 class MenuTests(unittest.TestCase):
-    """菜单循环：未预期异常兜底后继续运行，不退出。"""
+    """用确定的按键序列验证动作分发、结果显示及异常恢复，外部菜单操作均被替换。"""
 
     def test_run_menu_survives_unexpected_refresh_error(self):
         controller = ctl.DdnsController(Path(tempfile.gettempdir()))
@@ -1314,6 +1395,8 @@ class MenuTests(unittest.TestCase):
         calls = {"count": 0}
 
         def flaky_refresh():
+            """仅第一次刷新失败，随后恢复，使测试能区分继续运行与直接退出。"""
+
             calls["count"] += 1
             if calls["count"] == 1:
                 raise RuntimeError("boom")
@@ -1479,14 +1562,23 @@ class MenuTests(unittest.TestCase):
 
 
 class LogViewerTests(unittest.TestCase):
-    """日志查看：回退、分页、跟随、配色与菜单入口。"""
+    """验证日志回退、分页、跟随、输入及渲染；文件仅使用临时目录。
+
+    循环用例以 next_key 回放按键：None 留出一次自动刷新机会，x 结束查看；
+    refresh 返回 (是否变化, 可选错误结果)，poll_seconds=0 避免真实轮询等待。
+    多帧断言通常用 TtyStream.chunks 区分初始帧与各动作帧，不能只检查累计输出。
+    """
 
     def make_controller(self):
+        """创建日志用例的独立控制器，并注册临时目录清理。"""
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         return ctl.DdnsController(Path(temporary.name))
 
     def make_log(self, controller, name, content):
+        """在控制器的临时日志目录写入 UTF-8 样本，保留传入内容的末尾换行情况。"""
+
         log_path = controller.log_directory / name
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(content, encoding="utf-8")
@@ -1605,6 +1697,8 @@ class LogViewerTests(unittest.TestCase):
                 self.assertEqual(result.text, "已退出日志查看。")
 
     def test_redirected_eof_returns_to_menu(self):
+        """用读键器在 EOF 时返回的 Q 模拟输入关闭，验证查看页将其转为返回动作。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller, "ddns-go_20260803-071001.log", "内容"
@@ -1969,10 +2063,16 @@ class LogViewerTests(unittest.TestCase):
         ui.use_color = False
 
         class FakeStdin:
+            """声明为控制台输入，并在误入逐行读取分支时使测试立即失败。"""
+
             def isatty(self):
+                """固定控制台输入条件，与测试运行器是否重定向无关。"""
+
                 return True
 
             def readline(self):
+                """逐键用例不应走此回退接口。"""
+
                 raise AssertionError("interactive path must not use readline")
 
         cases = (
@@ -2027,10 +2127,16 @@ class LogViewerTests(unittest.TestCase):
         invalid_calls = []
 
         class FakeStdin:
+            """声明为控制台输入，并在误入逐行读取分支时使测试立即失败。"""
+
             def isatty(self):
+                """固定控制台输入条件，与测试运行器是否重定向无关。"""
+
                 return True
 
             def readline(self):
+                """逐键用例不应走此回退接口。"""
+
                 raise AssertionError("interactive path must not use readline")
 
         with (
@@ -2051,6 +2157,8 @@ class LogViewerTests(unittest.TestCase):
         self.assertNotIn("（无效按键）", out.getvalue())
 
     def test_loop_skips_redraw_when_nothing_changes(self):
+        """一次无输入、无日志变化的轮询不应产生新帧；返回操作也不重绘查看页。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller,
@@ -2062,6 +2170,7 @@ class LogViewerTests(unittest.TestCase):
         ui = ctl.ConsoleUI()
         ui.use_color = False
         stream = TtyStream()
+        # None 不是退出：让循环执行一次无变化刷新，下一次读到 x 才结束。
         keys = iter([None, "x"])
 
         def next_key():
@@ -2124,6 +2233,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # [0] 为初始帧，[1:4] 依次是 W、S、H 的结果帧；X 返回不再绘制查看页。
         self.assertEqual(len(stream.chunks), 4)
         self.assertIn("操作结果：已上页", stream.chunks[1])
         self.assertIn("操作结果：已下页", stream.chunks[2])
@@ -2167,6 +2277,7 @@ class LogViewerTests(unittest.TestCase):
         self.assertEqual(result.text, "已退出日志查看。")
         self.assertEqual(len(stream.chunks), 3)
         self.assertIn("操作结果：提示：无效按键", stream.chunks[1])
+        # 只检查 W 之后的帧；累计输出仍包含上一帧的无效提示，不能用于判断是否清除。
         self.assertNotIn("提示：无效按键", stream.chunks[2])
         self.assertIn("操作结果：已上页", stream.chunks[2])
 
@@ -2212,6 +2323,8 @@ class LogViewerTests(unittest.TestCase):
         self.assertNotIn("提示：无效按键", stream.chunks[2])
 
     def test_manual_refresh_key_rechecks_log_content(self):
+        """仅在 R 动作触发刷新时追加样本，分别验证有变化和无变化的反馈。"""
+
         for changed in (False, True):
             with self.subTest(changed=changed):
                 controller = self.make_controller()
@@ -2225,6 +2338,7 @@ class LogViewerTests(unittest.TestCase):
                 ui = ctl.ConsoleUI()
                 ui.use_color = False
                 stream = TtyStream()
+                # 不插入 None，排除自动刷新；新增内容只能由 R 动作调用 refresh 读入。
                 keys = iter(["r", "x"])
 
                 def next_key():
@@ -2344,6 +2458,8 @@ class LogViewerTests(unittest.TestCase):
         clean_method.assert_called_once_with(2)
 
     def test_c_cleans_zero_deletes_viewed_history_log(self):
+        """执行真实删除，验证查看页先释放历史日志句柄，保留零份后仍能返回。"""
+
         controller = self.make_controller()
         old_log = self.make_log(
             controller, "ddns-go_20260803-071001.log", "旧日志"
@@ -2388,6 +2504,8 @@ class LogViewerTests(unittest.TestCase):
         self.assertIn("删除旧 2 份", stream.getvalue())
 
     def test_c_cleans_logs_in_paging_mode_returns_to_last_page(self):
+        """模拟清理结果但保留原文件，验证重新打开后仍显示固定末页与跟随状态。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller,
@@ -2410,6 +2528,8 @@ class LogViewerTests(unittest.TestCase):
         reopened = {}
 
         def replace_reader(new_reader):
+            """记录查看页新打开的阅读器，供直接调用循环的本用例负责关闭。"""
+
             reopened["reader"] = new_reader
 
         with (
@@ -2450,10 +2570,14 @@ class LogViewerTests(unittest.TestCase):
         )
 
     def test_paging_and_follow_state_transitions(self):
+        """同为 45 行、每页 20 行，连续末窗从索引 25 开始，固定末页从 40 开始。"""
+
         self.assertEqual(ctl.latest_page_start(45), 25)
         self.assertEqual(ctl.last_page_start(45), 40)
         self.assertEqual(ctl.log_page_count(45), 3)
 
+        # 每项为 ((动作, 总行数, 零起始位置, 是否跟随), (新位置, 新跟随状态))；
+        # 各行独立传参，不依赖上一行执行后的状态。
         follow_cases = (
             (("prev", 45, 25, True), (5, False)),
             (("home", 45, 5, False), (0, False)),
@@ -2532,6 +2656,8 @@ class LogViewerTests(unittest.TestCase):
                 )
 
     def test_log_view_ad_shortcuts(self):
+        """历史函数名沿用；断言以现行键表为准，A 已无动作，D 用于清除结果。"""
+
         self.assertEqual(ctl.log_view_action("s"), "next")
         self.assertEqual(ctl.log_view_action("w"), "prev")
         self.assertEqual(ctl.log_view_action("r"), "refresh_log")
@@ -2661,6 +2787,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # [0] 连续末窗，[1] 切换后的固定末页，[2] 再切回末窗；两个 F 各产生一帧。
         self.assertEqual(len(stream.chunks), 3)
         self.assertIn("当页行区间: 26-45", stream.chunks[0])
         self.assertIn("连续模式 / 翻页模式", stream.chunks[0])
@@ -2670,6 +2797,7 @@ class LogViewerTests(unittest.TestCase):
         )
         self.assertIn("页 3/3", stream.chunks[1])
         self.assertIn("当页行区间: 41-45", stream.chunks[1])
+        # 样本文本从“第0行”命名，所以界面第 41 行对应的正文是“第40行”。
         self.assertIn("第40行", stream.chunks[1])
         self.assertIn("连续模式 / 翻页模式", stream.chunks[1])
         self.assertIn("操作结果：已切换为翻页模式", stream.chunks[1])
@@ -2776,6 +2904,7 @@ class LogViewerTests(unittest.TestCase):
         ui = ctl.ConsoleUI()
         ui.use_color = False
         stream = TtyStream()
+        # 先由 None 触发追加 10 行的刷新，再用 x 退出，保证只追加一次。
         keys = iter([None, "x"])
 
         def next_key():
@@ -2804,6 +2933,7 @@ class LogViewerTests(unittest.TestCase):
         self.assertEqual(result.text, "已退出日志查看。")
         self.assertEqual(len(stream.chunks), 2)
         self.assertIn("总行数: 55", stream.chunks[1])
+        # 同一刷新帧中总数已增加、行区间却不变，才能证明暂停有效而非刷新未执行。
         self.assertIn("当页行区间: 26-45", stream.chunks[1])
         self.assertIn("暂停末尾跟随", stream.chunks[1])
 
@@ -2819,6 +2949,7 @@ class LogViewerTests(unittest.TestCase):
         ui = ctl.ConsoleUI()
         ui.use_color = False
         stream = TtyStream()
+        # 留出一次自动刷新；起点索引 20 位于阅读中的旧页面，不应随新增内容移动。
         keys = iter([None, "x"])
 
         def next_key():
@@ -2850,6 +2981,8 @@ class LogViewerTests(unittest.TestCase):
         self.assertIn("暂停末尾跟随", stream.chunks[1])
 
     def test_paging_mode_follow_advances_on_new_page(self):
+        """追加 16 行使总数从 45 越过 60，验证跟随位置进入第四页而非停留第三页。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller,
@@ -2861,6 +2994,7 @@ class LogViewerTests(unittest.TestCase):
         ui = ctl.ConsoleUI()
         ui.use_color = False
         stream = TtyStream()
+        # None 使下方 refresh 追加内容，x 在下一轮退出；[1] 因而是唯一的新日志帧。
         keys = iter([None, "x"])
 
         def next_key():
@@ -2911,6 +3045,7 @@ class LogViewerTests(unittest.TestCase):
         def refresh():
             return False, None
 
+        # 用户行号 21 转为索引 20，连续窗口应显示 21-40，尚未到末窗 26-45。
         with (
             mock.patch.object(ctl, "read_line_number", return_value=21),
             mock.patch.object(sys, "stdout", stream),
@@ -2930,6 +3065,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # [0] 初始帧，[1] J 的输入提示帧，[2] 提交后的结果帧；数字输入本身已被 mock。
         self.assertEqual(len(stream.chunks), 3)
         self.assertIn("操作结果：提示：跳行输入中，仅数字键有效", stream.chunks[1])
         self.assertIn("当页行区间: 21-40", stream.chunks[2])
@@ -2975,6 +3111,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # [0] 初始帧，J 产生 [1]/[2]，两次 Z 产生 [3]/[4]；只在最后一帧检查不重复堆积。
         self.assertEqual(len(stream.chunks), 5)
         self.assertIn(
             "操作结果：提示：无效按键",
@@ -2986,6 +3123,8 @@ class LogViewerTests(unittest.TestCase):
         )
 
     def test_jump_goes_to_page_containing_line_in_paging_mode(self):
+        """连续跳到中间页和末页，分别验证暂停与恢复跟随，而非只验证目标行号。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller,
@@ -3005,6 +3144,7 @@ class LogViewerTests(unittest.TestCase):
         def refresh():
             return False, None
 
+        # 行号 21、45 对应索引 20、44，再按每页 20 行对齐为页起点 20、40。
         with (
             mock.patch.object(ctl, "read_line_number", side_effect=[21, 45]),
             mock.patch.object(sys, "stdout", stream),
@@ -3024,6 +3164,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # 两次 J 各产生提示帧和结果帧：[1]/[2] 对应第一次，[3]/[4] 对应第二次。
         self.assertEqual(len(stream.chunks), 5)
         self.assertIn("操作结果：提示：跳行输入中，仅数字键有效", stream.chunks[1])
         self.assertIn("页 2/3", stream.chunks[2])
@@ -3054,6 +3195,7 @@ class LogViewerTests(unittest.TestCase):
         def refresh():
             return False, None
 
+        # 此处 None 是数字输入的取消结果，不是 next_key 的“暂无按键”，不会提交跳转。
         with (
             mock.patch.object(ctl, "read_line_number", return_value=None),
             mock.patch.object(sys, "stdout", stream),
@@ -3080,6 +3222,8 @@ class LogViewerTests(unittest.TestCase):
         self.assertIn("操作结果：-", stream.chunks[2])
 
     def test_jump_ignores_non_digit_during_input(self):
+        """保留真实数字输入逻辑，只回放原始按键；无效键不能破坏已输入的数字。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller,
@@ -3122,6 +3266,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # 本用例保留真实数字输入，提示和逐键回显也会写入 chunks，不能要求恰好三次写入。
         self.assertGreaterEqual(len(stream.chunks), 3)
         self.assertIn(
             "操作结果：提示：跳行输入中，仅数字键有效",
@@ -3212,6 +3357,7 @@ class LogViewerTests(unittest.TestCase):
         self.assertEqual(result.text, "已退出日志查看。")
         self.assertEqual(len(stream.chunks), 3)
         self.assertIn("操作结果：提示：跳行输入中，仅数字键有效", stream.chunks[1])
+        # 拒绝越界输入后检查结果帧 [2]：位置与跟随状态都应保留，不能只断言错误文案。
         self.assertIn("当页行区间: 26-45", stream.chunks[2])
         self.assertIn("跟随中", stream.chunks[2])
         self.assertIn("操作结果：行号 999 不存在，有效范围 1-45", stream.chunks[2])
@@ -3277,6 +3423,7 @@ class LogViewerTests(unittest.TestCase):
         def refresh():
             return False, None
 
+        # 页码从 1 开始，页起点为 (页码 - 1) * 20；第 2、3 页分别从索引 20、40 开始。
         with (
             mock.patch.object(ctl, "read_line_number", side_effect=[2, 3]),
             mock.patch.object(sys, "stdout", stream),
@@ -3296,6 +3443,7 @@ class LogViewerTests(unittest.TestCase):
             )
 
         self.assertEqual(result.text, "已退出日志查看。")
+        # [0] 初始帧；两次 K 的提示位于 [1]/[3]，提交后的页面位于 [2]/[4]。
         self.assertEqual(len(stream.chunks), 5)
         self.assertIn("操作结果：提示：跳页输入中，仅数字键有效", stream.chunks[1])
         self.assertIn("页 2/3", stream.chunks[2])
@@ -3353,6 +3501,8 @@ class LogViewerTests(unittest.TestCase):
         self.assertIn("操作结果：页码 99 不存在，有效范围 1-3", stream.chunks[2])
 
     def test_jump_page_only_in_paging_mode(self):
+        """连续模式应直接提示跳页不可用；若仍调用数字输入则由 mock 立即报错。"""
+
         controller = self.make_controller()
         log_path = self.make_log(
             controller,
@@ -3427,6 +3577,7 @@ class LogViewerTests(unittest.TestCase):
         self.addCleanup(reader.close)
 
         self.assertEqual(reader.lines(), ["旧内容"])
+        # 新内容必须短于旧内容，才能触发按文件大小判断的截断分支。
         log_path.write_text("新行\n", encoding="utf-8")
 
         self.assertTrue(reader.update())
@@ -3440,6 +3591,7 @@ class LogViewerTests(unittest.TestCase):
         reader = ctl.LogViewReader(log_path)
         self.addCleanup(reader.close)
 
+        # 这里检查对象身份而不只比较文本：完整行共享列表，半行展示另组列表。
         first = reader.lines()
         self.assertIs(first, reader.lines())
         with log_path.open("a", encoding="utf-8") as stream:
@@ -3486,6 +3638,8 @@ class PollUntilTests(unittest.TestCase):
         calls = {"count": 0}
 
         def succeed_on_second_call() -> bool:
+            """让首轮未满足、次轮满足，确保覆盖重试而非只覆盖立即成功。"""
+
             calls["count"] += 1
             return calls["count"] >= 2
 
@@ -3523,6 +3677,8 @@ class ActionResultTests(unittest.TestCase):
 
     def test_invoke_menu_action_renders_errors_in_red(self):
         def failing_action():
+            """提供可展示的业务异常，验证菜单包装器的错误转换。"""
+
             raise ctl.DdnsError("出错了")
 
         result = ctl.invoke_menu_action(failing_action)
@@ -3532,6 +3688,8 @@ class ActionResultTests(unittest.TestCase):
 
 
 class ConsoleUITests(unittest.TestCase):
+    """验证主菜单路径格式、颜色和清屏序列，输出捕获到内存，不依赖肉眼检查。"""
+
     def test_render_shows_absolute_directory_and_relative_paths(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -3544,13 +3702,15 @@ class ConsoleUITests(unittest.TestCase):
         with mock.patch.object(sys, "stdout", stream):
             ui.render(state, controller, None)
         text = stream.getvalue()
-        self.assertIn(str(controller.script_directory) + os.sep, text)
+        directory_text = str(controller.script_directory).replace(os.sep, "/") + "/"
+        self.assertIn(directory_text, text)
         self.assertIn("ddns-go_ctl.py", text)
         self.assertIn("ddns-go.exe", text)
         self.assertIn("ctl-data/.ddns_go_config.yaml", text)
         self.assertNotIn(
-            str(controller.script_directory) + os.sep + "ddns-go.exe", text
+            directory_text + "ddns-go.exe", text
         )
+        self.assertNotIn(str(controller.script_directory) + os.sep, text)
         self.assertIn("操作结果：-", text)
 
     def test_operation_result_label_uses_default_color(self):
@@ -3638,7 +3798,11 @@ class ConsoleUITests(unittest.TestCase):
         ui.use_color = False
 
         class TtyStream(io.StringIO):
+            """保留 StringIO 的文本接口，仅强制启用 TTY 清屏分支。"""
+
             def isatty(self) -> bool:
+                """使清屏断言不受测试运行器输出重定向影响。"""
+
                 return True
 
         stream = TtyStream()
@@ -3649,6 +3813,8 @@ class ConsoleUITests(unittest.TestCase):
 
 
 class SingleInstanceMutexTests(unittest.TestCase):
+    """使用真实 Windows 命名互斥量，验证同目录互斥、释放后重入和不同目录隔离。"""
+
     def test_second_instance_is_rejected(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -3674,6 +3840,7 @@ class SingleInstanceMutexTests(unittest.TestCase):
                 pass
 
 
+# 直接运行时检查 Windows 平台并执行本文件用例；discover 导入时由外部运行器执行。
 if __name__ == "__main__":
     if os.name != "nt":
         print("该测试仅支持 Windows。", file=sys.stderr)

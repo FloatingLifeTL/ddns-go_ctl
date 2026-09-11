@@ -3,8 +3,8 @@
 脚本完全使用 Python 标准库，不导入或探测任何第三方 Python 包。
 
 版本与更新时间：
-- 脚本版本：v2.8.0
-  更新时间：2026-09-09-Wed
+- 脚本版本：v2.8.1
+  更新时间：2026-09-11-Fri
 - 脚本定版实测：
   DDNS-GO 版本：v6.17.7
   兼容说明：脚本不绑定 DDNS-GO 具体版本，原则上可用于其他版本，但不保证全部兼容。
@@ -173,7 +173,7 @@ LOG_VIEW_DIGITS_ONLY_MESSAGE = "提示：仅数字键有效"
 LOG_VIEW_JUMPING_MESSAGE = "提示：跳行输入中，仅数字键有效"
 LOG_VIEW_JUMP_PAGE_MESSAGE = "提示：跳页输入中，仅数字键有效"
 # 脚本自身版本，与 README.md 保持一致。
-SCRIPT_VERSION = "2.8.0"
+SCRIPT_VERSION = "2.8.1"
 
 # ===== 按键配置 =====
 # 一级菜单与二级菜单统一格式：
@@ -361,7 +361,10 @@ class Settings:
     def build_start_arguments(
         self, executable_path: Path, config_path: Path
     ) -> List[str]:
-        """组装 DDNS-GO 启动参数；配置为 None 的项一律不传，沿用其自身默认值。"""
+        """组装 DDNS-GO 的 argv；此方法只构造参数，不启动进程。
+
+        可选配置为 None 时不加入参数，额外参数原样追加到列表末尾。
+        """
 
         arguments = [
             str(executable_path),
@@ -1406,7 +1409,12 @@ def parse_relay_arguments(arguments: Sequence[str]) -> argparse.Namespace:
 
 
 def run_log_relay(arguments: Sequence[str]) -> int:
-    """托管一个 DDNS-GO 进程，并将其全部输出透明转发到控制台与日志。"""
+    """运行私有转发器，托管 DDNS-GO 并将其输出转发到控制台与日志。
+
+    创建停止事件、状态文件、日志文件和 Job Object；异常时尽力回收子进程并
+    写入故障状态。即使参数来自控制器，也会核验命令首项属于运行目录中的
+    `ddns-go.exe`。成功返回 0，参数或运行失败返回 1。
+    """
 
     try:
         options = parse_relay_arguments(arguments)
@@ -1845,7 +1853,7 @@ class DdnsController:
         try:
             relative = os.path.relpath(str(path), str(self.script_directory))
         except ValueError:  # Windows 下不同驱动器无法计算相对路径
-            return str(path)
+            return str(path).replace(os.sep, "/")
         return relative.replace(os.sep, "/")
 
     def new_state(
@@ -1954,6 +1962,9 @@ class DdnsController:
         运行状态文件从不单独作为“健康”依据；DDNS-GO 路径、转发器路径、该次启动的
         命名事件和日志文件必须同时存在。target_process_ids 仍是唯一允许停止的集合。
         传入已核对的 runtime_state 时可避免重复读取状态文件。
+
+        端口查询、状态文件或日志链路异常会转换为对应状态，而不是伪装成正常未运行。
+        可传入已读取的状态和本轮进程探测结果，以避免重复访问文件或查询进程。
         """
 
         # 程序文件缺失是最基础的状态，直接返回，不继续做进程与端口查询。
@@ -2336,6 +2347,9 @@ class DdnsController:
 
         启动超时但进程仍存活时保留转发器、DDNS-GO 与状态文件，并返回警告；只有
         明确失败才会回收本次启动创建的两个进程。
+
+        hidden 为 False 时创建独立控制台并回显 DDNS-GO 输出。明确启动失败时会
+        尽力清理；仅端口确认超时时保留已创建的运行链路并返回警告。
         """
 
         state = self.get_state()
@@ -2469,7 +2483,12 @@ class DdnsController:
         return ActionResult(text, color)
 
     def stop(self) -> ActionResult:
-        """仅停止状态检查已确认属于当前目录 EXE 的候选进程。"""
+        """停止状态检查已确认属于当前目录 EXE 的候选进程。
+
+        优先通知本次启动的转发器安全收尾，必要时终止已核验进程，并写入
+        `status="stopped"`。强制停止前会在同一进程句柄上再次核验完整映像路径；
+        无法核验的 PID 不会被终止。
+        """
 
         state = self.get_state()
 
@@ -2735,9 +2754,9 @@ class ConsoleUI(IConsoleOutput):
             log_hint = self.colorize("（暂无运行时日志）", "bright_black")
         field("转发器", str(relay_process_id))
         field("端口", str(controller.port))
-        directory_text = str(controller.script_directory)
-        if not directory_text.endswith(os.sep):
-            directory_text += os.sep
+        directory_text = str(controller.script_directory).replace(os.sep, "/")
+        if not directory_text.endswith("/"):
+            directory_text += "/"
         field("目录", f"\"{directory_text}\"")
         field("程序", f"\"{controller.display_path(state.executable_path)}\"")
         field("ctl", f"\"{controller.display_path(controller_self_path())}\"")
@@ -3296,7 +3315,11 @@ class LogViewerSession:
         self._render()
 
     def _handle_action(self, action: Optional[str]) -> Optional[ActionResult]:
-        """处理一条查看页按键动作；返回错误结果时结束当前会话。"""
+        """处理一条日志查看页动作并更新状态；返回结果表示当前会话应结束。
+
+        翻页、连续模式和末尾跟随各自保持既定位置语义；日志清理前关闭阅读器，
+        清理后再替换为原文件、最新历史文件或空阅读器。
+        """
 
         state = self.state
         if action == "return":
@@ -3555,7 +3578,12 @@ def view_runtime_log(
     state: DdnsState,
     ui: IConsoleOutput,
 ) -> ActionResult:
-    """进入运行时日志查看页；无当前日志时回退到最新历史日志，无日志时显示空占位。"""
+    """进入运行时日志查看页，并在退出时释放当前阅读器。
+
+    优先打开当前日志，文件不存在时回退到最新历史日志，目录为空时使用空阅读器。
+    TTY 下实时轮询刷新，非 TTY 下使用逐行输入；日志清理后可能替换阅读器，
+    所有退出路径都会关闭最终持有的阅读器。
+    """
 
     try:
         reader, log_path, log_kind = open_log_reader(
@@ -3852,5 +3880,6 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
         return 1
 
 
+# 仅在直接执行脚本时启动主流程；被测试或其他模块导入时不自动进入菜单。
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -33,7 +33,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 `tests/` 下按 `test_*.py` 命名的是独立测试模块，上述发现命令会一次跑完；新增测试文件放入该目录即可自动纳入，无需改动 CI 配置。
 
 5. 检查 `.gitignore`，确保构建产物、日志、可执行文件和本地路径不会进入公开副本。
-6. 用户可见变化同步更新 `docs/releases/v<version>.md`；发布 EXE 时同时记录附件名称、大小、Python/PyInstaller 版本和是否代码签名，并为每个产物生成 `SHA256SUMS.txt` 校验清单一并上传。
+6. 用户可见变化同步更新 `docs/releases/v<version>.md`；发布 EXE 时在发布说明中记录附件名称和校验清单是否随附，并按发布规范生成 `SHA256SUMS.txt` 清单一并上传。资产大小、构建信息和 SHA-256 以发布页和清单为准，不写入发布说明。
 7. 更新 `docs/THIRD_PARTY_NOTICES.md`，如果外部依赖范围发生变化。
 
 ## 提交说明
